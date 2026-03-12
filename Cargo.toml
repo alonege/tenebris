@@ -1,0 +1,47 @@
+[package]
+name = "tenebris"
+version = "0.1.0"
+edition = "2024"
+authors = ["alonege <kacper141414@gmail.com>"]
+description = "A from-scratch machine learning library written in pure Rust."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/alonege/tenebris"
+readme = "README.md"
+keywords = [
+  "machine-learning",
+  "tensor",
+  "neural-network",
+  "deep-learning",
+  "ai",
+]
+categories = ["science", "mathematics"]
+
+[dependencies]
+anyhow = "1.0.100"
+faer = { version = "0.22.6", features = ["std", "serde", "perf-warn", "rayon"] }
+num-traits = "0.2.19"
+num_cpus = "1.17.0"
+rand = "0.9.1"
+rand_distr = "0.5.1"
+rayon = "1.11.0"
+serde = { version = "1.0.219", features = ["derive"] }
+thiserror = "2.0.17"
+
+[dev-dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+reqwest = { version = "0.11", features = ["blocking"] }
+tar = "0.4"
+flate2 = "1.0"
+tempfile = "3.3"
+rand = "0.9.2"
+indicatif = { version = "0.18.2", features = ["rayon"] }
+rayon = "1.11.0"
+num-traits = "0.2.19"
+image = "0.25.8"
+tikv-jemallocator = "0.6.1"
+mimalloc = "0.1.48"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
