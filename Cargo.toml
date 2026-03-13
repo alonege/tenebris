@@ -1,6 +1,6 @@
 [package]
 name = "tenebris"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 authors = ["alonege <kacper141414@gmail.com>"]
 description = "A from-scratch machine learning library written in pure Rust."

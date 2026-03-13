@@ -19,10 +19,10 @@ Clone the repository and run one of the development binaries:
 
 ```bash
 # Run the Multi-Layer Perceptron (MLP) -- XOR example
-cargo run --manifest-path dev/Cargo.toml --release
+cargo run --release --example xor
 
 # Run the Convolutional Neural Network (CNN) example
-cargo run --manifest-path devconv2/Cargo.toml --release
+cargo run --release --example cifarconv2d
 ```
 
 ## Roadmap / Future Research
