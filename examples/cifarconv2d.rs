@@ -34,9 +34,9 @@ use tenebris::{
     layer::{Layer, chain::ChainBuilder},
     optimizer::sgd::SGDWithMomentumHyperParams,
 };
-use tikv_jemallocator::Jemalloc;
-#[global_allocator]
-static GLOBAL: Jemalloc = Jemalloc;
+//use tikv_jemallocator::Jemalloc;
+//#[global_allocator]
+//static GLOBAL: Jemalloc = Jemalloc;
 
 //use mimalloc::MiMalloc;
 

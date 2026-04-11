@@ -52,6 +52,16 @@ where
         self.layer1.clear_grad();
         self.layer2.clear_grad();
     }
+
+    fn training(&mut self) {
+        self.layer1.training();
+        self.layer2.training();
+    }
+
+    fn inference(&mut self) {
+        self.layer1.inference();
+        self.layer2.inference();
+    }
 }
 
 // auto implementation for any Layer, so we can chain as many as we want without worrying about the
