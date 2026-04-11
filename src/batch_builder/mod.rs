@@ -13,11 +13,11 @@ impl BatchBuilder {
         BatchBuilder
     }
 
-    pub fn build_batches<T: TensorFloat>(
-        data: &Vec<Tensor<T>>,
+    pub fn build_batches<T: TensorFloat, const D: usize>(
+        data: &Vec<Tensor<T, D>>,
         shuffle: bool,
         batch_size: usize,
-    ) -> Result<Vec<Tensor<T>>, LibError> {
+    ) -> Result<Vec<Tensor<T, D>>, LibError> {
         let mut batches = Vec::new();
         let mut indices: Vec<usize> = (0..data.len()).collect();
         let mut rng = rng();
@@ -34,11 +34,7 @@ impl BatchBuilder {
             current_batch_data.extend_from_slice(tensor_data);
             current_batch_content_counter += 1;
             if current_batch_content_counter == batch_size || i == data.len() - 1 {
-                let mut shape = data[0]
-                    .shape()
-                    .iter()
-                    .map(|&dim| dim as usize)
-                    .collect::<Vec<usize>>();
+                let mut shape = data[0].shape().clone();
                 let shape_len = shape.len();
                 shape[shape_len - 1] = current_batch_content_counter;
                 let batch_tensor = Tensor::new(shape, current_batch_data.clone())?;
@@ -51,12 +47,12 @@ impl BatchBuilder {
         Ok(batches)
     }
 
-    pub fn build_batches_with_labels<T: TensorFloat>(
-        data: &Vec<Tensor<T>>,
-        labels: &Vec<Tensor<T>>,
+    pub fn build_batches_with_labels<T: TensorFloat, const D: usize>(
+        data: &Vec<Tensor<T, D>>,
+        labels: &Vec<Tensor<T, D>>,
         shuffle: bool,
         batch_size: usize,
-    ) -> Result<(Vec<Tensor<T>>, Vec<Tensor<T>>), LibError> {
+    ) -> Result<(Vec<Tensor<T, D>>, Vec<Tensor<T, D>>), LibError> {
         let mut batches = Vec::new();
         let mut batches_labels = Vec::new();
         let mut indices: Vec<usize> = (0..data.len()).collect();
@@ -81,21 +77,13 @@ impl BatchBuilder {
             current_batch_content_counter += 1;
 
             if current_batch_content_counter == batch_size || i == data.len() - 1 {
-                let mut shape = data[0]
-                    .shape()
-                    .iter()
-                    .map(|&dim| dim as usize)
-                    .collect::<Vec<usize>>();
+                let mut shape = data[0].shape().clone();
                 let shape_len = shape.len();
                 shape[shape_len - 1] = current_batch_content_counter;
                 let batch_tensor = Tensor::new(shape, current_batch_data.clone())?;
                 batches.push(batch_tensor);
 
-                let mut shape_labels = labels[0]
-                    .shape()
-                    .iter()
-                    .map(|&dim| dim as usize)
-                    .collect::<Vec<usize>>();
+                let mut shape_labels = labels[0].shape().clone();
                 let shape_labels_len = shape_labels.len();
                 shape_labels[shape_labels_len - 1] = current_batch_content_counter;
                 let batch_labels_tensor = Tensor::new(shape_labels, current_batch_labels.clone())?;
@@ -110,13 +98,13 @@ impl BatchBuilder {
         Ok((batches, batches_labels))
     }
 
-    pub fn build_batches_with_labels2<T: TensorFloat>(
-        data: &Vec<Tensor<T>>,
-        labels: &Vec<Tensor<T>>,
+    pub fn build_batches_with_labels2<T: TensorFloat, const D: usize>(
+        data: &Vec<Tensor<T, D>>,
+        labels: &Vec<Tensor<T, D>>,
         shuffle: bool,
         batch_size: usize,
         augmentation: AugmentationOptions,
-    ) -> Result<Vec<(Tensor<T>, Tensor<T>)>, LibError> {
+    ) -> Result<Vec<(Tensor<T, D>, Tensor<T, D>)>, LibError> {
         let mut batches = Vec::new();
         let mut indices: Vec<usize> = (0..data.len()).collect();
         let mut rng = rng();
@@ -148,20 +136,12 @@ impl BatchBuilder {
             current_batch_content_counter += 1;
 
             if current_batch_content_counter == batch_size || i == data.len() - 1 {
-                let mut shape = data[0]
-                    .shape()
-                    .iter()
-                    .map(|&dim| dim as usize)
-                    .collect::<Vec<usize>>();
+                let mut shape = data[0].shape().clone();
                 let shape_len = shape.len();
                 shape[shape_len - 1] = current_batch_content_counter;
                 let batch_tensor = Tensor::new(shape, current_batch_data.clone())?;
 
-                let mut shape_labels = labels[0]
-                    .shape()
-                    .iter()
-                    .map(|&dim| dim as usize)
-                    .collect::<Vec<usize>>();
+                let mut shape_labels = labels[0].shape().clone();
                 let shape_labels_len = shape_labels.len();
                 shape_labels[shape_labels_len - 1] = current_batch_content_counter;
                 let batch_labels_tensor = Tensor::new(shape_labels, current_batch_labels.clone())?;

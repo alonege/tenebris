@@ -1,6 +1,6 @@
 use crate::{
     error::LibError,
-    layer::{Module, Tensor, TensorFloat},
+    layer::{Layer, Tensor, TensorFloat},
 };
 use std::marker::PhantomData;
 
@@ -20,38 +20,32 @@ impl<T: TensorFloat> Flatten<T> {
     }
 }
 
-impl<T: TensorFloat> Module<T> for Flatten<T> {
-    type Input<A> = Tensor<T>;
-    type Output<B> = Tensor<T>;
+impl<T: TensorFloat, const D: usize> Layer<Tensor<T, D>> for Flatten<T> {
+    type Output = Tensor<T, 2>;
 
-    fn forward(
-        &mut self,
-        input: Self::Input<T>,
-        save_grads: bool,
-    ) -> Result<Self::Output<T>, LibError> {
+    fn forward(&mut self, input: Tensor<T, D>, save_grads: bool) -> Result<Self::Output, LibError> {
         if save_grads {
             self.input_shape_cache = Some(input.shape().to_vec());
         }
         let n = *input.shape().last().unwrap_or(&1);
         let features = input.shape().iter().product::<usize>() / n;
-        input.reshape(vec![features, n])
+        input.reshape([features, n])
     }
 
-    fn backward(&mut self, grad_output: Self::Input<T>) -> Result<Self::Output<T>, LibError> {
-        let original_shape = self
+    fn backward(&mut self, grad_output: Self::Output) -> Result<Tensor<T, D>, LibError> {
+        let original_shape_vec = self
             .input_shape_cache
             .as_ref()
             .ok_or_else(|| LibError::LayerErrorBackwardNoGradient)?;
 
-        grad_output.reshape(original_shape.clone())
+        let mut original_shape = [0usize; D];
+        original_shape.copy_from_slice(original_shape_vec);
+
+        grad_output.reshape(original_shape)
     }
 
-    fn parameters(&self) -> Vec<Tensor<T>> {
-        vec![]
-    }
-
-    fn parameters_mut(&mut self) -> Vec<&mut Tensor<T>> {
-        vec![]
+    fn visit_params<O: crate::optimizer::Optimizer>(&mut self, _optimizer: &mut O) {
+        // No parameters to update
     }
 
     fn clear_grad(&mut self) {

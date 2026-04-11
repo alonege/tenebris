@@ -3,12 +3,16 @@ use crate::{
     tensor::tensor::{Tensor, TensorFloat},
 };
 
-pub trait ErrorFn<T: TensorFloat> {
-    fn compute(&self, y_pred: &Tensor<T>, y_true: &Tensor<T>) -> Result<(T, Tensor<T>), LibError>;
-    fn loss(&self, y_pred: &Tensor<T>, y_true: &Tensor<T>) -> Result<T, LibError> {
+pub trait ErrorFn<T: TensorFloat, const D: usize> {
+    fn compute(
+        &self,
+        y_pred: &Tensor<T, D>,
+        y_true: &Tensor<T, D>,
+    ) -> Result<(T, Tensor<T, D>), LibError>;
+    fn loss(&self, y_pred: &Tensor<T, D>, y_true: &Tensor<T, D>) -> Result<T, LibError> {
         Ok(self.compute(y_pred, y_true)?.0)
     }
-    fn grad(&self, y_pred: &Tensor<T>, y_true: &Tensor<T>) -> Result<Tensor<T>, LibError> {
+    fn grad(&self, y_pred: &Tensor<T, D>, y_true: &Tensor<T, D>) -> Result<Tensor<T, D>, LibError> {
         Ok(self.compute(y_pred, y_true)?.1)
     }
 }

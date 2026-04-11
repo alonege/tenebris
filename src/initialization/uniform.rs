@@ -1,7 +1,8 @@
 use rand::distr::{Distribution, Uniform as UniformDist};
 use rand::rng;
 
-use crate::{initialization::Initialization, tensor::tensor::TensorFloat};
+use crate::initialization::InitializationRawData;
+use crate::tensor::tensor::TensorFloat;
 
 #[derive(Clone, Copy)]
 pub struct Uniform;
@@ -12,7 +13,7 @@ impl Uniform {
     }
 }
 
-impl<T: TensorFloat> Initialization<T> for Uniform {
+impl<T: TensorFloat> InitializationRawData<T> for Uniform {
     fn initialize_data(
         &self,
         _fan_in: usize,

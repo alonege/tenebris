@@ -1,8 +1,7 @@
-use std::collections::HashMap;
+use std::{any::Any, collections::HashMap};
 
 use crate::{
     error::{self, LibError},
-    layer::Module,
     optimizer::Optimizer,
     tensor::{
         tensor::{Tensor, TensorFloat},
@@ -10,104 +9,127 @@ use crate::{
     },
 };
 
-pub struct SGD<T> {
-    pub learning_rate: T,
+pub struct SGDHyperParams {
+    pub learning_rate: f64,
 }
 
-impl<T> SGD<T> {
-    pub fn new(lr: T) -> Self {
-        Self { learning_rate: lr }
+pub struct SGD {
+    hyper_params: SGDHyperParams,
+}
+
+impl SGD {
+    pub fn new(hyper_params: SGDHyperParams) -> Self {
+        Self { hyper_params }
     }
 }
 
-impl<T> Optimizer<T> for SGD<T>
-where
-    T: TensorFloat,
-{
-    fn step(&mut self, module: &mut impl Module<T>) -> Result<(), LibError> {
-        for param in module.parameters_mut() {
-            let grad = param.grad.take();
-            let mut grad = match grad {
-                Some(g) => *g,
-                None => return Err(error::LibError::LayerErrorBackwardNoGradient),
-            };
-            grad.map_inplace(|v| -v * self.learning_rate);
-            let updated_value = param.tensoradd(&grad);
-            let updated_value = match updated_value {
-                Ok(v) => v,
-                Err(e) => return Err(e),
-            };
-            param.change_tensor(updated_value);
-        }
+impl Optimizer for SGD {
+    type HyperParams = SGDHyperParams;
 
-        module.clear_grad();
+    fn update_tensor<T: TensorFloat, const D: usize>(
+        &mut self,
+        tensor: &mut Tensor<T, D>,
+    ) -> Result<(), LibError> {
+        let grad = tensor.grad.take();
+        let mut grad = match grad {
+            Some(g) => *g,
+            None => return Err(error::LibError::LayerErrorBackwardNoGradient),
+        };
+        grad.map_inplace(|v| -v * T::from(self.hyper_params.learning_rate).unwrap());
+        let updated_value = tensor.tensoradd(&grad);
+        let updated_value = match updated_value {
+            Ok(v) => v,
+            Err(e) => return Err(e),
+        };
+        tensor.change_tensor(updated_value);
         Ok(())
     }
 
-    fn get_learning_rate(&self) -> T {
-        self.learning_rate
+    #[inline(always)]
+    fn get_hyper_params(&self) -> &Self::HyperParams {
+        &self.hyper_params
     }
 
-    fn set_learning_rate(&mut self, lr: T) {
-        self.learning_rate = lr;
+    #[inline(always)]
+    fn set_hyper_params(&mut self, hyper_params: Self::HyperParams) {
+        self.hyper_params = hyper_params;
     }
 }
 
-pub struct SGDWithMomentum<T: TensorFloat> {
-    lr: T,
-    momentum: T,
-    decay: T,
-    velocity: HashMap<usize, Tensor<T>>,
+pub struct SGDWithMomentumHyperParams {
+    pub learning_rate: f64,
+    pub momentum: f64,
+    pub decay: f64,
 }
 
-impl<T: TensorFloat> SGDWithMomentum<T> {
-    pub fn new(lr: T, momentum: T, decay: T) -> Self {
+pub struct SGDWithMomentum {
+    hyper_params: SGDWithMomentumHyperParams,
+    velocity: HashMap<usize, Box<dyn Any>>,
+}
+
+impl SGDWithMomentum {
+    pub fn new(hyper_params: SGDWithMomentumHyperParams) -> Self {
         Self {
-            lr,
-            momentum,
-            decay,
+            hyper_params,
             velocity: HashMap::new(),
         }
     }
 }
 
-impl<T: TensorFloat> Optimizer<T> for SGDWithMomentum<T> {
+impl Optimizer for SGDWithMomentum {
+    type HyperParams = SGDWithMomentumHyperParams;
+
     #[inline(always)]
-    fn step(&mut self, model: &mut impl Module<T>) -> Result<(), LibError> {
-        let params = model.parameters_mut();
+    fn update_tensor<T: TensorFloat, const D: usize>(
+        &mut self,
+        tensor: &mut Tensor<T, D>,
+    ) -> Result<(), LibError> {
+        if let Some(grad) = &tensor.grad {
+            let i = tensor.get_id(); // Zgodnie z nowym nazewnictwem: tensor.id
 
-        for (i, param) in params.into_iter().enumerate() {
-            if let Some(grad) = &param.grad {
-                // get/create velocity
-                let velocity = self
-                    .velocity
-                    .entry(i)
-                    .or_insert_with(|| Tensor::zeros(param.shape().to_vec()).unwrap());
+            // 1. Zapisujemy/Pobieramy "czarną skrzynkę" z HashMapy.
+            // Zauważ rzutowanie `as Box<dyn Any>` przy tworzeniu!
+            let velocity_any = self.velocity.entry(i).or_insert_with(|| {
+                Box::new(Tensor::<T, D>::zeros(*tensor.shape()).unwrap()) as Box<dyn Any>
+            });
 
-                // v = momentum * v + grad
-                *velocity = velocity
-                    .map(|x| *x * self.momentum)
-                    .tensoradd(grad)
-                    .unwrap();
+            // 2. MAGIA RUSTA: Odzyskujemy typ Tensor<T, D> z czarnej skrzynki (Downcasting)!
+            let velocity = velocity_any
+                .downcast_mut::<Tensor<T, D>>()
+                .expect("Krytyczny błąd optymalizatora: Niezgodność typu w cache Momentum!");
 
-                // param -= lr * v
-                *param = param
-                    .map(|x| *x * (T::one() - self.decay * self.lr))
-                    .sub(&velocity.map(|x| *x * self.lr))
-                    .unwrap();
-            }
+            // 3. Konwersje hyperparametrów z f64 do generycznego T
+            let momentum = T::from(self.hyper_params.momentum).unwrap();
+            let lr = T::from(self.hyper_params.learning_rate).unwrap();
+            let decay = T::from(self.hyper_params.decay).unwrap();
+            let one = T::one();
+
+            // v = momentum * v + grad
+            *velocity = velocity.map(|x| *x * momentum).tensoradd(grad).unwrap();
+
+            // tensor -= lr * v
+            // Najpierw wyliczamy współczynnik wygaszania wag (weight decay factor)
+            let decay_factor = one - (decay * lr);
+
+            // Wyliczamy przesunięcie z momentum
+            let velocity_step = velocity.map(|x| *x * lr);
+
+            // Aplikujemy to do tensora!
+            *tensor = tensor
+                .map(|x| *x * decay_factor)
+                .sub(&velocity_step)
+                .unwrap();
         }
 
-        model.clear_grad();
         Ok(())
     }
 
     #[inline(always)]
-    fn get_learning_rate(&self) -> T {
-        self.lr
+    fn get_hyper_params(&self) -> &Self::HyperParams {
+        &self.hyper_params
     }
     #[inline(always)]
-    fn set_learning_rate(&mut self, lr: T) {
-        self.lr = lr;
+    fn set_hyper_params(&mut self, hyper_params: Self::HyperParams) {
+        self.hyper_params = hyper_params;
     }
 }

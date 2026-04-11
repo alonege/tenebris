@@ -16,7 +16,10 @@ impl SoftmaxCrossEntropy {
     /// Helper fn -- returns max in 0 axis (for each batch element)
     /// ## Returns
     /// tensor [1, N].
-    fn max_axis_0<T: TensorFloat>(&self, tensor: &Tensor<T>) -> Result<Tensor<T>, LibError> {
+    fn max_axis_0<T: TensorFloat, const D: usize>(
+        &self,
+        tensor: &Tensor<T, D>,
+    ) -> Result<Tensor<T, 2>, LibError> {
         let rows = tensor.shape()[0];
         let cols = tensor.shape()[1];
         let mut max_data = Vec::with_capacity(cols);
@@ -32,12 +35,16 @@ impl SoftmaxCrossEntropy {
             }
             max_data.push(col_max);
         }
-        Tensor::new(vec![1, cols], max_data)
+        Tensor::new([1, cols], max_data)
     }
 }
 
-impl<T: TensorFloat> ErrorFn<T> for SoftmaxCrossEntropy {
-    fn compute(&self, logits: &Tensor<T>, targets: &Tensor<T>) -> Result<(T, Tensor<T>), LibError> {
+impl<T: TensorFloat> ErrorFn<T, 2> for SoftmaxCrossEntropy {
+    fn compute(
+        &self,
+        logits: &Tensor<T, 2>,
+        targets: &Tensor<T, 2>,
+    ) -> Result<(T, Tensor<T, 2>), LibError> {
         if logits.shape() != targets.shape() {
             return Err(LibError::ShapeMismatch {
                 operation: "SoftmaxCrossEntropy::compute".into(),
@@ -55,7 +62,7 @@ impl<T: TensorFloat> ErrorFn<T> for SoftmaxCrossEntropy {
         // dla każdego elementu batcha dostajemy max dla danej próbki
         let max_vals = self.max_axis_0(logits)?;
         //println!("Max vals: {:?}", max_vals);
-        let max_vals_expanded = max_vals.expand(logits.shape())?;
+        let max_vals_expanded = max_vals.expand(*logits.shape())?;
         //println!("Max vals expanded: {:?}", max_vals_expanded);
 
         // shifted = logits - M
@@ -67,10 +74,10 @@ impl<T: TensorFloat> ErrorFn<T> for SoftmaxCrossEntropy {
         //println!("Exp shifted: {:?}", exp_shifted);
 
         // sum_exp = sum(exp_shifted)
-        let sum_exp = exp_shifted.sum(0);
+        let sum_exp = exp_shifted.sum_keepdim(0);
         //println!("Sum exp: {:?}", sum_exp);
         let log_sum_exp = sum_exp.map(|x| x.ln());
-        let log_sum_exp_expanded = log_sum_exp.expand(logits.shape())?;
+        let log_sum_exp_expanded = log_sum_exp.expand(*logits.shape())?;
 
         // log_probs = shifted - log(sum(exp))
         let log_probs = shifted.sub(&log_sum_exp_expanded)?;
@@ -112,9 +119,9 @@ mod tests {
     fn test_error_fn_trait_usage() {
         // Setup: Batch 1, 2 klasy
         // Logity: [0, 0] -> Probs: [0.5, 0.5]
-        let logits = Tensor::new(vec![2, 1], vec![0.0, 0.0]).unwrap();
+        let logits = Tensor::new([2, 1], vec![0.0, 0.0]).unwrap();
         // Target: Klasa 0
-        let targets = Tensor::new(vec![2, 1], vec![1.0, 0.0]).unwrap();
+        let targets = Tensor::new([2, 1], vec![1.0, 0.0]).unwrap();
 
         let criterion = SoftmaxCrossEntropy::new();
 
@@ -141,14 +148,14 @@ mod tests {
         let criterion = SoftmaxCrossEntropy::new();
 
         // Uniform random logits (model nie wie nic)
-        let logits = Tensor::zeros(&[10, 128]).unwrap(); // Batch=128, classes=10
+        let logits = Tensor::zeros([10, 128]).unwrap(); // Batch=128, classes=10
 
         // Random targets (one-hot)
         let mut targets_data = vec![0.0; 10 * 128];
         for b in 0..128 {
             targets_data[b] = 1.0; // Klasa 0 dla wszystkich (dla prostoty)
         }
-        let targets = Tensor::from_slice(vec![10, 128], targets_data).unwrap();
+        let targets = Tensor::from_slice([10, 128], targets_data).unwrap();
 
         let (loss, _grad) = criterion.compute(&logits, &targets).unwrap();
 
@@ -171,7 +178,7 @@ mod tests {
 
         // Batch=2, classes=3
         let logits = Tensor::from_slice(
-            vec![3, 2],
+            [3, 2],
             vec![
                 1.0, 2.0, // class 0
                 2.0, 1.0, // class 1
@@ -181,7 +188,7 @@ mod tests {
         .unwrap();
 
         let targets = Tensor::from_slice(
-            vec![3, 2],
+            [3, 2],
             vec![
                 1.0, 0.0, // sample 0: class 0
                 0.0, 1.0, // sample 1: class 1
@@ -213,13 +220,13 @@ mod tests {
         let criterion = SoftmaxCrossEntropy::new();
 
         // Single sample
-        let logits_1: Tensor<f32> = Tensor::new(
-            vec![10, 1],
+        let logits_1: Tensor<f32, 2> = Tensor::new(
+            [10, 1],
             vec![0.5, 0.1, 0.2, 0.3, -0.1, -0.2, -0.3, -0.4, -0.5, -0.6],
         )
         .unwrap();
         let targets_1 = Tensor::new(
-            vec![10, 1],
+            [10, 1],
             vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
         )
         .unwrap();
@@ -227,7 +234,7 @@ mod tests {
 
         // Batch of 2 identical samples
         let logits_2 = Tensor::new(
-            vec![10, 2],
+            [10, 2],
             vec![
                 0.5, 0.1, 0.2, 0.3, -0.1, -0.2, -0.3, -0.4, -0.5, -0.6, 0.5, 0.1, 0.2, 0.3, -0.1,
                 -0.2, -0.3, -0.4, -0.5, -0.6,
@@ -235,7 +242,7 @@ mod tests {
         )
         .unwrap();
         let targets_2 = Tensor::new(
-            vec![10, 2],
+            [10, 2],
             vec![
                 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0,
                 0.0, 0.0, 0.0, 0.0,

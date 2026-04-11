@@ -1,46 +1,46 @@
-//! Warstwa Dropout dla regularyzacji sieci neuronowych.
+//! Dropout layer for neural network regularization.
 //!
-//! Dropout losowo zeruje elementy tensora wejściowego z prawdopodobieństwem `p`
-//! podczas treningu, skalując pozostałe wartości przez `1/(1-p)` (inverted dropout).
-//! Podczas inferencji warstwa działa jako funkcja tożsamości.
+//! Dropout randomly zeroes some of the elements of the input tensor with probability `p`
+//! during training, scaling the remaining values by `1/(1-p)` (inverted dropout).
+//! During inference, the layer acts as an identity function.
 
 use crate::error::LibError;
-use crate::layer::Module;
+use crate::layer::Layer;
 use crate::tensor::tensor::Tensor;
 use crate::tensor::tensor::TensorFloat;
 use rand::Rng;
 
-/// Warstwa Dropout implementująca regularyzację przez losowe zerowanie aktywacji.
+/// Dropout layer implementing regularization via random zeroing of activations.
 ///
-/// # Opis matematyczny
-/// Podczas treningu (forward z `save_grads = true`):
+/// # Mathematical Description
+/// During training (forward pass with `save_grads = true`):
 /// ```text
 /// mask[i] ~ Bernoulli(1 - p)
 /// output = input * mask * scale
-/// gdzie scale = 1 / (1 - p)
+/// where scale = 1 / (1 - p)
 /// ```
 ///
-/// Podczas inferencji:
+/// During inference:
 /// ```text
 /// output = input
 /// ```
 ///
-/// # Obsługa batchy
-/// Maska jest generowana dla każdego elementu tensora niezależnie.
-/// Dzięki temu warstwa automatycznie obsługuje dowolne kształty tensorów,
-/// w tym batche o wymiarach `(features, batch_size)` lub `(C, H, W, B)`.
+/// # Batch Handling
+/// The mask is generated independently for every single element of the tensor.
+/// This allows the layer to automatically support any tensor shape natively,
+/// including batched dimensions like `[Features, Batch]` or `[C, W, H, N]`.
 ///
-/// # Przykład użycia
+/// # Example
 /// rust
 /// use libmlrs::layer::dropout::Dropout;
 /// use crate::libmlrs::layer::Module;
 /// let mut dropout = Dropout::<f32>::new(0.5); // 50% dropout
 ///
-/// // Trening
+/// // Training
 /// dropout.set_training(true);
 /// let output = dropout.forward(input, true)?;
 ///
-/// // Inferencja  
+/// // Inference
 /// dropout.set_training(false);
 /// let output = dropout.forward(input, false)?;
 /// Ok(())
@@ -55,19 +55,19 @@ pub struct Dropout<T: TensorFloat> {
     training: bool,
     /// Zacachowana maska binarna (dla backward pass)
     /// Przechowuje wartości 0 lub `scale` dla każdego elementu
-    mask_cache: Option<Tensor<T>>,
+    mask_cache: Option<Tensor<T, 1>>,
 }
 
 impl<T: TensorFloat> Dropout<T> {
-    /// Tworzy nową warstwę Dropout.
+    /// Creates a new Dropout layer.
     ///
-    /// # Argumenty
-    /// * `p` - Prawdopodobieństwo wyzerowania elementu (0.0 ≤ p < 1.0)
+    /// # Arguments
+    /// * `p` - Probability of zeroing an element (0.0 ≤ p < 1.0)
     ///
     /// # Panics
-    /// Panikuje jeśli `p < 0` lub `p >= 1`.
+    /// Panics if `p < 0` or `p >= 1`.
     ///
-    /// # Przykład
+    /// # Example
     /// rust
     /// use libmlrs::layer::dropout::Dropout;
     /// use crate::libmlrs::layer::Module;
@@ -88,40 +88,52 @@ impl<T: TensorFloat> Dropout<T> {
         Self {
             p,
             scale,
-            training: true, // Domyślnie w trybie treningowym
+            training: true, // Training mode by default
             mask_cache: None,
         }
     }
 
-    /// Ustawia tryb działania warstwy.
+    /// Sets the mode of the layer.
     ///
-    /// # Argumenty
-    /// * `training` - `true` dla trybu treningowego, `false` dla inferencji
+    /// # Arguments
+    /// * `training` - `true` for training mode, `false` for inference
+    #[inline(always)]
     pub fn set_training(&mut self, training: bool) {
         self.training = training;
     }
 
-    /// Sprawdza czy warstwa jest w trybie treningowym.
+    /// Checks if the layer is currently in training mode.
+    #[inline(always)]
     pub fn is_training(&self) -> bool {
         self.training
     }
 
-    /// Zwraca prawdopodobieństwo dropout.
+    /// Returns the dropout probability.
+    #[inline(always)]
     pub fn dropout_probability(&self) -> T {
         self.p
     }
 
-    /// Generuje maskę dropout dla tensora o zadanym kształcie.
+    /// Switches the layer to training mode.
+    #[inline(always)]
+    pub fn train(&mut self) {
+        self.set_training(true);
+    }
+
+    /// Switches the layer to inference (evaluation) mode.
+    #[inline(always)]
+    pub fn eval(&mut self) {
+        self.set_training(false);
+    }
+
+    /// Generates a flat 1D dropout mask for a given number of elements.
     ///
-    /// Maska zawiera wartości:
-    /// - `scale` (= 1/(1-p)) z prawdopodobieństwem (1-p)
-    /// - `0` z prawdopodobieństwem p
-    fn generate_mask(&self, shape: &[usize]) -> Tensor<T> {
+    /// The mask contains:
+    /// - `scale` (= 1/(1-p)) with probability (1-p)
+    /// - `0` with probability p
+    fn generate_mask(&self, numel: usize) -> Tensor<T, 1> {
         let mut rng = rand::rng();
         let zero = T::zero();
-        //let one = T::one();
-
-        let numel: usize = shape.iter().product();
 
         let p_f64: f64 = self.p.to_f64().unwrap_or(0.5);
 
@@ -132,42 +144,36 @@ impl<T: TensorFloat> Dropout<T> {
             })
             .collect();
 
-        Tensor::from_slice(shape.to_vec(), data).unwrap()
+        Tensor::new([numel], data).unwrap()
     }
 }
 
-impl<T: TensorFloat> Module<T> for Dropout<T> {
-    type Input<A> = Tensor<T>;
-    type Output<B> = Tensor<T>;
+impl<T: TensorFloat, const D: usize> Layer<Tensor<T, D>> for Dropout<T> {
+    type Output = Tensor<T, D>;
 
-    /// Propagacja w przód.
+    /// Forward pass.
     ///
-    /// # Argumenty
-    /// * `input` - Tensor wejściowy dowolnego kształtu
-    /// * `save_grads` - Czy zachować dane dla backward pass
-    ///
-    /// # Zwraca
-    /// * `Ok(output)` - Tensor wyjściowy tego samego kształtu
-    /// * `Err(LibError)` - W przypadku błędu
-    ///
-    /// # Zachowanie
-    /// - Tryb treningowy (`training = true`): stosuje dropout z skalowaniem
-    /// - Tryb inferencji (`training = false`): zwraca kopię wejścia bez zmian
+    /// # Behavior
+    /// - Training mode (`training = true`): applies dropout mask with inverted scaling.
+    /// - Inference mode (`training = false`): returns the input identically.
     #[inline(always)]
-    fn forward(
-        &mut self,
-        input: Self::Input<T>,
-        save_grads: bool,
-    ) -> Result<Self::Output<T>, LibError> {
-        // W trybie inferencji lub gdy p = 0, zwróć wejście bez zmian
+    fn forward(&mut self, input: Tensor<T, D>, save_grads: bool) -> Result<Self::Output, LibError> {
+        // Bypass completely if in inference mode or probability is 0
         if !self.training || self.p == T::zero() {
             self.mask_cache = None;
             return Ok(input);
         }
 
-        let mask = self.generate_mask(input.shape());
+        // Calculate total elements
+        let numel: usize = input.shape().iter().product();
 
-        let output = input.mul_elem(&mask);
+        // Generate a contiguous 1D mask
+        let mask = self.generate_mask(numel);
+
+        // Zero-cost abstraction: Reshape the 1D mask to match the input's D-dimensional shape
+        let mask_d: Tensor<T, D> = mask.reshape(input.shape().clone())?;
+
+        let output = input.mul_elem(&mask_d);
 
         if save_grads {
             self.mask_cache = Some(mask);
@@ -178,47 +184,34 @@ impl<T: TensorFloat> Module<T> for Dropout<T> {
         Ok(output)
     }
 
-    /// Propagacja wsteczna.
+    /// Backward pass.
     ///
-    /// # Argumenty
-    /// * `upstream_grad` - Gradient z warstwy wyżej (ten sam kształt co output)
-    ///
-    /// # Zwraca
-    /// * `Ok(downstream_grad)` - Gradient dla warstwy niżej
-    /// * `Err(LibError)` - Gdy brak zacachowanej maski
-    ///
-    /// # Matematyka
+    /// # Math
     /// ```text
-    /// d(loss)/d(input) = d(loss)/d(output) * d(output)/d(input)
-    ///                  = upstream_grad * mask
+    /// d(loss)/d(input) = upstream_grad * mask
     /// ```
-    /// Gradient przepływa tylko przez nie-wyzerowane elementy, skalowany przez `scale`.
-    fn backward(&mut self, upstream_grad: Self::Output<T>) -> Result<Self::Input<T>, LibError> {
+    /// Gradients only flow through non-zeroed elements, scaled by the factor.
+    fn backward(&mut self, upstream_grad: Self::Output) -> Result<Tensor<T, D>, LibError> {
         if !self.training || self.p == T::zero() {
             return Ok(upstream_grad);
         }
 
-        let mask = self.mask_cache.take().ok_or_else(|| {
-            LibError::OtherError(
-                "Dropout backward called without cached mask. \
-                      Ensure forward() was called with save_grads=true"
-                    .to_string(),
-            )
-        })?;
+        let mask = self
+            .mask_cache
+            .take()
+            .ok_or_else(|| LibError::LayerErrorBackwardNoGradient)?;
 
-        let downstream_grad = upstream_grad.mul_elem(&mask);
+        // Restore the mask to D dimensions to match the upstream gradient
+        let mask_d: Tensor<T, D> = mask.reshape(upstream_grad.shape().clone())?;
+
+        let downstream_grad = upstream_grad.mul_elem(&mask_d);
 
         Ok(downstream_grad)
     }
 
     #[inline(always)]
-    fn parameters(&self) -> Vec<Tensor<T>> {
-        Vec::new()
-    }
-
-    #[inline(always)]
-    fn parameters_mut(&mut self) -> Vec<&mut Tensor<T>> {
-        Vec::new()
+    fn visit_params<O: crate::optimizer::Optimizer>(&mut self, _optimizer: &mut O) {
+        // Dropout has no learnable parameters. Do nothing.
     }
 
     #[inline(always)]
@@ -248,7 +241,7 @@ mod tests {
         let mut dropout = Dropout::<f32>::new(0.5);
 
         // Utwórz tensor wejściowy 3x3
-        let input = Tensor::ones(&[3, 3]).unwrap();
+        let input = Tensor::ones([3, 3]).unwrap();
 
         // Forward w trybie treningowym
         dropout.set_training(true);
@@ -274,7 +267,7 @@ mod tests {
     fn test_dropout_inference_mode() {
         let mut dropout = Dropout::<f32>::new(0.5);
 
-        let input = Tensor::from_slice(vec![2, 2], vec![1.0, 2.0, 3.0, 4.0]).unwrap();
+        let input = Tensor::from_slice([2, 2], vec![1.0, 2.0, 3.0, 4.0]).unwrap();
 
         // Forward w trybie inferencji
         dropout.set_training(false);
@@ -295,7 +288,7 @@ mod tests {
         let mut dropout = Dropout::<f32>::new(0.0);
         dropout.set_training(true);
 
-        let input = Tensor::from_slice(vec![2, 2], vec![1.0, 2.0, 3.0, 4.0]).unwrap();
+        let input = Tensor::from_slice([2, 2], vec![1.0, 2.0, 3.0, 4.0]).unwrap();
         let output = dropout.forward(input.clone(), true).unwrap();
 
         for (a, b) in input.iter().zip(output.iter()) {
@@ -309,7 +302,7 @@ mod tests {
         let mut dropout = Dropout::<f32>::new(0.5);
         dropout.set_training(true);
 
-        let input = Tensor::ones(&[1000]).unwrap();
+        let input = Tensor::ones([1000]).unwrap();
         let output = dropout.forward(input, true).unwrap();
 
         // Niezerowe wartości powinny być skalowane przez 1/(1-p) = 2
@@ -328,11 +321,11 @@ mod tests {
         let mut dropout = Dropout::<f32>::new(0.5);
         dropout.set_training(true);
 
-        let input = Tensor::ones(&[4, 4]).unwrap();
+        let input = Tensor::ones([4, 4]).unwrap();
         let _output = dropout.forward(input, true).unwrap();
 
         // Upstream gradient = wszystkie jedynki
-        let upstream = Tensor::ones(&[4, 4]).unwrap();
+        let upstream = Tensor::ones([4, 4]).unwrap();
         let downstream = dropout.backward(upstream).unwrap();
 
         // Downstream powinien mieć ten sam wzorzec co output (0 lub scale)
@@ -346,7 +339,7 @@ mod tests {
         dropout.set_training(true);
 
         // Symulacja batcha: (features=10, height=4, batch=8)
-        let input = Tensor::ones(&[10, 4, 8]).unwrap();
+        let input = Tensor::ones([10, 4, 8]).unwrap();
         let output = dropout.forward(input.clone(), true).unwrap();
 
         assert_eq!(output.shape(), input.shape());
@@ -359,7 +352,7 @@ mod tests {
         dropout.set_training(true);
 
         // Symulacja conv output: (channels=16, height=8, width=8, batch=4)
-        let input = Tensor::ones(&[16, 8, 8, 4]).unwrap();
+        let input = Tensor::ones([16, 8, 8, 4]).unwrap();
         let output = dropout.forward(input.clone(), true).unwrap();
 
         assert_eq!(output.shape(), input.shape());
@@ -371,7 +364,7 @@ mod tests {
         let mut dropout = Dropout::<f32>::new(0.5);
         dropout.set_training(true);
 
-        let upstream = Tensor::ones(&[2, 2]).unwrap();
+        let upstream = Tensor::ones([2, 2]).unwrap();
         let result = dropout.backward(upstream);
 
         assert!(result.is_err(), "Backward without forward should fail");
@@ -383,20 +376,13 @@ mod tests {
         let mut dropout = Dropout::<f32>::new(0.5);
         dropout.set_training(true);
 
-        let input = Tensor::ones(&[3, 3]).unwrap();
+        let input = Tensor::ones([3, 3]).unwrap();
         let _output = dropout.forward(input, true).unwrap();
 
         assert!(dropout.mask_cache.is_some());
 
-        dropout.clear_grad();
+        <Dropout<f32> as Layer<Tensor<f32, 2>>>::clear_grad(&mut dropout);
 
         assert!(dropout.mask_cache.is_none());
-    }
-
-    /// Test że parameters() zwraca pusty wektor
-    #[test]
-    fn test_dropout_no_parameters() {
-        let dropout = Dropout::<f32>::new(0.5);
-        assert!(dropout.parameters().is_empty());
     }
 }

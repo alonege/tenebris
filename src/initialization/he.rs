@@ -2,7 +2,7 @@ use rand::distr::Distribution;
 use rand::rng;
 use rand_distr::Normal as NormalDist;
 
-use crate::{error::LibError, initialization::Initialization, tensor::tensor::TensorFloat};
+use crate::{error::LibError, initialization::InitializationRawData, tensor::tensor::TensorFloat};
 
 /// He/Kaiming initialization
 ///
@@ -18,7 +18,7 @@ impl He {
     }
 }
 
-impl<T: TensorFloat> Initialization<T> for He {
+impl<T: TensorFloat> InitializationRawData<T> for He {
     fn initialize_data(
         &self,
         fan_in: usize,

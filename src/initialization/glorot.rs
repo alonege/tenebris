@@ -1,7 +1,11 @@
 use rand::rng;
 use rand_distr::{Distribution, Normal as NormalDist};
 
-use crate::{error::LibError, initialization::Initialization, tensor::tensor::TensorFloat};
+use crate::{
+    error::LibError,
+    initialization::{Initialization, InitializationRawData},
+    tensor::tensor::TensorFloat,
+};
 
 /// Xavier/Glorot initialization
 ///
@@ -20,7 +24,7 @@ impl Glorot {
     }
 }
 
-impl<T: TensorFloat> Initialization<T> for Glorot {
+impl<T: TensorFloat> InitializationRawData<T> for Glorot {
     fn initialize_data(
         &self,
         fan_in: usize,
@@ -41,6 +45,8 @@ impl<T: TensorFloat> Initialization<T> for Glorot {
         Ok(data)
     }
 }
+
+impl<T: TensorFloat> Initialization<T> for Glorot {}
 
 impl Default for Glorot {
     fn default() -> Self {

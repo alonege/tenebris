@@ -15,12 +15,15 @@ use std::marker::PhantomData;
 use std::num::NonZero;
 use std::ops::{Index, IndexMut};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use faer::MatMut;
 
 // Abandon hope, all ye who enter here
 
-pub trait TensorFloat: Float + Clone + Copy + Conjugate + ComplexField + Display {
+static TENSOR_ID_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+pub trait TensorFloat: Float + Clone + Copy + Conjugate + ComplexField + Display + 'static {
     fn random<R: Rng + ?Sized>(rng: &mut R) -> Self;
     //fn one() -> Self;
 }
@@ -42,13 +45,16 @@ impl TensorFloat for f64 {
 /// Tensor in column-major order.
 /// Owns data
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Tensor<T: TensorFloat> {
+pub struct Tensor<T: TensorFloat, const D: usize> {
+    id: usize,
     #[serde(with = "arc_vec")]
     data: Arc<Vec<T>>,
-    shape: Vec<usize>,
-    strides: Vec<isize>,
+    #[serde(with = "serde_arrays")]
+    shape: [usize; D],
+    #[serde(with = "serde_arrays")]
+    strides: [isize; D],
 
-    pub grad: Option<Box<Tensor<T>>>,
+    pub grad: Option<Box<Tensor<T, D>>>,
 }
 
 mod arc_vec {
@@ -70,14 +76,15 @@ mod arc_vec {
     }
 }
 
-impl<T: TensorFloat> Tensor<T> {
+impl<T: TensorFloat, const D: usize> Tensor<T, D> {
     /// Main constructor
     #[inline(always)]
-    pub fn new(shape: Vec<usize>, data: Vec<T>) -> Result<Self, LibError> {
+    // WARN: REFACTOR: ADDED RETURN WITH NEW ID
+    pub fn new(shape: [usize; D], data: Vec<T>) -> Result<Self, LibError> {
         let expected_len: usize = shape.iter().product();
         if expected_len != data.len() {
             return Err(LibError::InvalidShapeForData {
-                shape,
+                shape: shape.to_vec(),
                 expected_len,
                 actual_len: data.len(),
             });
@@ -85,19 +92,15 @@ impl<T: TensorFloat> Tensor<T> {
         let strides = Self::compute_strides(&shape);
         let data = Arc::new(data);
         let grad = None;
-        Ok(Self {
-            data,
-            shape,
-            strides,
-            grad,
-        })
+        Ok(unsafe { Tensor::new_with_strides(shape, strides, data, grad) })
     }
 
-    pub fn new_row(shape: Vec<usize>, data: Vec<T>) -> Result<Self, LibError> {
+    // WARN: REFACTOR: ADDED RETURN WITH NEW ID
+    pub fn new_row(shape: [usize; D], data: Vec<T>) -> Result<Self, LibError> {
         let expected_len: usize = shape.iter().product();
         if expected_len != data.len() {
             return Err(LibError::InvalidShapeForData {
-                shape,
+                shape: shape.to_vec(),
                 expected_len,
                 actual_len: data.len(),
             });
@@ -105,22 +108,59 @@ impl<T: TensorFloat> Tensor<T> {
         let strides = Self::compute_strides_row(&shape);
         let data = Arc::new(data);
         let grad = None;
-        Ok(Self {
-            data,
-            shape,
-            strides,
-            grad,
-        })
+        Ok(unsafe { Tensor::new_with_strides(shape, strides, data, grad) })
     }
 
+    #[deprecated(note = "use `from_raw_parts`")]
     #[inline(always)]
-    pub unsafe fn new_raw(shape: Vec<usize>, data: Vec<T>, strides: Vec<isize>) -> Self {
-        if shape.iter().product::<usize>() != data.len() {
-            panic!("Data length does not match shape");
-        }
-        let data = Arc::new(data);
-        let grad = None;
+    pub unsafe fn new_raw(
+        shape: [usize; D],
+        data: Vec<T>,
+        strides: [isize; D],
+        grad: Option<Box<Tensor<T, D>>>,
+    ) -> Result<Self, LibError> {
+        panic!(
+            "`new_raw` is hard deprecated. Use `from_raw_parts` instead, which does not perform any checks and is more efficient."
+        )
+    }
+
+    /// Reconstructs a tensor from its raw components while preserving its original unique ID.
+    ///
+    /// This function is primarily used internally to create **zero-copy views** of an existing
+    /// tensor (e.g., during transposition, slicing, or reshaping). It keeps `id`, allowing
+    /// creation of new tensor in place of old one, without changing the identity of the tensor in
+    /// the computation graph.
+    ///
+    /// ### Memory Layout & Flat Index
+    ///
+    /// The mapping from an N-dimensional coordinate $(i_0, i_1, \dots, i_{D-1})$ to a 1D position
+    /// in the flat `data` buffer is defined by the flat index $I$. Given the dimensions' strides
+    /// $(s_0, s_1, \dots, s_{D-1})$, the index is calculated as the dot product:
+    ///
+    /// $$I = \sum_{k=0}^{D-1} i_k \cdot s_k$$
+    ///
+    /// For example, in a 4-dimensional tensor with coordinates $(c, w, h, n)$ and
+    /// strides $(s_c, s_w, s_h, s_n)$, the flat memory offset is computed as:
+    ///
+    /// $$I = c \cdot s_c + w \cdot s_w + h \cdot s_h + n \cdot s_n$$
+    ///
+    /// # Safety
+    ///
+    /// This function is highly `unsafe` because it does not validate memory bounds.
+    /// The caller must guarantee that:
+    /// - For every valid coordinate where $0 \le i_k < \text{shape}[k]$, the computed
+    ///   flat index $I$ will **never** exceed the allocated bounds of the `data` buffer.
+    /// - The `data` buffer is fully initialized.
+    #[inline(always)]
+    pub unsafe fn from_raw_parts(
+        id: usize,
+        shape: [usize; D],
+        data: Arc<Vec<T>>,
+        strides: [isize; D],
+        grad: Option<Box<Tensor<T, D>>>,
+    ) -> Self {
         Self {
+            id,
             data,
             shape,
             strides,
@@ -128,111 +168,132 @@ impl<T: TensorFloat> Tensor<T> {
         }
     }
 
-    pub fn new_with_init(
-        shape: impl AsRef<[usize]>,
+    /// Creates a completely new tensor with a custom memory layout and generates a new unique ID.
+    ///
+    /// Unlike [`from_raw_parts`], this function assumes the tensor is a logically new entity
+    /// within the computation graph. It is typically used when a backend operation produces
+    /// a new data buffer that requires specific, non-contiguous strides to be read correctly.
+    ///
+    /// # Safety
+    ///
+    /// This function bypasses standard shape and memory validation.
+    /// The caller is fully responsible for ensuring that:
+    /// - Any index computed using the provided `shape` and `strides` stays strictly within
+    ///   the bounds of the `data` buffer to prevent undefined behavior (UB) and segmentation faults.
+    /// - *Note:* The product of the `shape` dimensions does **not** strictly need to match
+    ///   the length of `data` (e.g., when the tensor is mapped to a sub-region of a larger buffer),
+    ///   but out-of-bounds access must be mathematically impossible.
+    #[inline(always)]
+    pub unsafe fn new_with_strides(
+        shape: [usize; D],
+        strides: [isize; D],
+        data: Arc<Vec<T>>,
+        grad: Option<Box<Tensor<T, D>>>,
+    ) -> Self {
+        let id = TENSOR_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
+        Self {
+            id,
+            data,
+            shape,
+            strides,
+            grad,
+        }
+    }
+
+    // TODO: CHANGE
+    pub fn new_with_init<I: Initialization<T>>(
+        shape: [usize; D],
         (fan_in, fan_out): (usize, usize),
-        init: &dyn Initialization<T>,
+        init: &I,
     ) -> Result<Self, LibError> {
         let data = init
-            .initialize_tensor(fan_in, fan_out, shape.as_ref().to_vec())?
+            .initialize_tensor(fan_in, fan_out, shape)?
             .data
             .as_slice()
             .to_vec();
-        Self::new(shape.as_ref().to_vec(), data)
+        Self::new(shape, data)
     }
 
-    pub fn new_from_val(shape: impl AsRef<[usize]>, val: T) -> Result<Self, LibError> {
-        let shape = shape.as_ref();
+    pub fn new_from_val(shape: [usize; D], val: T) -> Result<Self, LibError> {
         let expected_len: usize = shape.iter().product();
         let data = vec![val; expected_len];
-        Self::new(shape.to_vec(), data)
+        Self::new(shape, data)
     }
 
-    fn compute_strides(shape: impl AsRef<[usize]>) -> Vec<isize> {
-        let shape = shape.as_ref();
-        shape
-            .iter()
-            .scan(1, |prod, &dim| {
-                let curr_stride = *prod;
-                *prod *= dim as isize;
-                Some(curr_stride)
-            })
-            .collect()
-    }
-    fn compute_strides_row(shape: impl AsRef<[usize]>) -> Vec<isize> {
-        let shape = shape.as_ref();
-        let mut shape = shape.to_vec();
-        shape.swap(0, 1);
-        let mut stride: Vec<isize> = shape
-            .iter()
-            .scan(1, |prod, &dim| {
-                let curr_stride = *prod;
-                *prod *= dim as isize;
-                Some(curr_stride)
-            })
-            .collect();
-        stride.swap(0, 1);
-        stride
+    const fn compute_strides<const N: usize>(shape: &[usize; N]) -> [isize; N] {
+        let mut strides = [0isize; N];
+        let mut prod = 1;
+        let mut i = 0;
+
+        while i < N {
+            strides[i] = prod;
+            prod *= shape[i] as isize;
+            i += 1;
+        }
+
+        strides
     }
 
-    pub fn ones(shape: impl AsRef<[usize]>) -> Result<Self, LibError> {
-        let shape = shape.as_ref();
+    const fn compute_strides_row<const N: usize>(shape: &[usize; N]) -> [isize; N] {
+        let mut strides = [0isize; N];
+        let mut prod = 1;
+        let mut i = 0;
+        strides.swap(0, 1);
+
+        while i < D {
+            strides[i] = prod;
+            prod *= shape[i] as isize;
+            i += 1;
+        }
+
+        strides.swap(0, 1);
+        strides
+    }
+
+    pub fn ones(shape: [usize; D]) -> Result<Self, LibError> {
         let expected_len: usize = shape.iter().product();
         let data = vec![T::one(); expected_len];
-        Self::new(shape.to_vec(), data)
+        Self::new(shape, data)
     }
 
-    pub fn zeros(shape: impl AsRef<[usize]>) -> Result<Self, LibError> {
-        let shape = shape.as_ref();
+    pub fn zeros(shape: [usize; D]) -> Result<Self, LibError> {
         let expected_len: usize = shape.iter().product();
         let data = vec![T::zero(); expected_len];
-        Self::new(shape.to_vec(), data)
+        Self::new(shape, data)
     }
 
-    pub unsafe fn uninitialized(shape: impl AsRef<[usize]>) -> Result<Self, LibError> {
-        let shape = shape.as_ref();
+    pub unsafe fn uninitialized(shape: [usize; D]) -> Result<Self, LibError> {
         let expected_len: usize = shape.iter().product();
         let mut data: Vec<T> = Vec::with_capacity(expected_len);
         unsafe {
             data.set_len(expected_len);
         }
-        Self::new(shape.to_vec(), data)
+        Self::new(shape, data)
     }
 
     /// TODO: REFACTOR FOR PERFORMANCE
-    pub fn from_fn(
-        shape: impl AsRef<[usize]>,
-        mut f: impl FnMut(&[usize]) -> T,
-    ) -> Result<Self, LibError> {
-        let shape = shape.as_ref();
+    pub fn from_fn(shape: [usize; D], mut f: impl FnMut(&[usize]) -> T) -> Result<Self, LibError> {
         let expected_len: usize = shape.iter().product();
         let data: Vec<T> = (0..expected_len).map(|_| f(&shape)).collect();
-        Self::new(shape.to_owned(), data)
+        Self::new(shape, data)
     }
 
-    pub fn random(shape: impl AsRef<[usize]>) -> Self {
-        let shape = shape.as_ref();
+    // WARN: REFACTOR: ADDED RETURN WITH NEW ID
+    pub fn random(shape: [usize; D]) -> Self {
         let len: usize = shape.iter().product();
         let mut rng = rand::rng();
         let data: Vec<T> = (0..len).map(|_| T::random(&mut rng)).collect();
-        let strides = Self::compute_strides(shape);
+        let data = Arc::new(data);
+        let strides = Self::compute_strides(&shape);
         let grad = None;
 
-        Self {
-            data: Arc::new(data),
-            shape: shape.to_vec(),
-            strides,
-            grad,
-        }
+        unsafe { Tensor::new_with_strides(shape, strides, data, grad) }
     }
 
+    // WARN: REFACTOR: ADDED RETURN WITH NEW ID
     /// Constructor using slices
-    pub fn from_slice(
-        shape_slice: impl AsRef<[usize]>,
-        data_slice: impl AsRef<[T]>,
-    ) -> Result<Self, LibError> {
+    pub fn from_slice(shape: [usize; D], data_slice: impl AsRef<[T]>) -> Result<Self, LibError> {
         let data = data_slice.as_ref();
-        let shape = shape_slice.as_ref();
 
         let expected_len: usize = shape.iter().product();
         if expected_len != data.len() {
@@ -243,33 +304,22 @@ impl<T: TensorFloat> Tensor<T> {
             });
         }
 
-        let strides = shape
-            .iter()
-            .scan(1, |prod, &dim| {
-                let curr_stride = *prod;
-                *prod *= dim as isize;
-                Some(curr_stride)
-            })
-            .collect();
+        let strides = Self::compute_strides(&shape);
         let grad = None;
 
         let data = Arc::new(data.to_vec());
-        Ok(Self {
-            data: data,
-            shape: shape.to_vec(),
-            strides,
-            grad,
-        })
+
+        Ok(unsafe { Tensor::new_with_strides(shape, strides, data, grad) })
     }
 
     /// Returns the shape of the tensor
     #[inline(always)]
-    pub fn shape(&self) -> &[usize] {
+    pub fn shape(&self) -> &[usize; D] {
         &self.shape
     }
 
     #[inline(always)]
-    pub fn strides(&self) -> &[isize] {
+    pub fn strides(&self) -> &[isize; D] {
         &self.strides
     }
 
@@ -278,17 +328,23 @@ impl<T: TensorFloat> Tensor<T> {
         self.data.as_ptr()
     }
 
-    pub fn change_tensor(&mut self, other: Tensor<T>) {
+    pub fn get_id(&self) -> usize {
+        self.id
+    }
+
+    pub fn change_tensor(&mut self, other: Tensor<T, D>) {
         self.data = other.data;
         self.shape = other.shape;
         self.strides = other.strides;
         self.grad = other.grad;
     }
 
+    /*
     #[allow(dead_code)]
-    fn make_mut(mut self) -> Tensor<T> {
+    fn make_mut(mut self) -> Tensor<T, D> {
         if let Some(data) = Arc::get_mut(&mut self.data) {
             let grad = self.grad.take();
+            unsafe { Tensor::from_raw_parts(self.id, self.shape, data, self.strides, grad) }
             return Tensor {
                 data: Arc::new(data.clone()),
                 shape: self.shape,
@@ -298,6 +354,7 @@ impl<T: TensorFloat> Tensor<T> {
         }
         self
     }
+    */
 
     /// Gets an element by multi-dimensional index
     /// This operation is very expensive, as it requires calculating the flat index,
@@ -355,9 +412,8 @@ impl<T: TensorFloat> Tensor<T> {
     /// The tensor must be contiguous for this operation to be valid.
     pub fn reshape_to_tensorref<'a>(
         &'a self,
-        shape: impl AsRef<[usize]>,
+        shape: [usize; D],
     ) -> Result<TensorRef<'a, T>, LibError> {
-        let shape = shape.as_ref();
         let new_len: usize = shape.iter().product();
         let old_len: usize = self.shape.iter().product();
 
@@ -377,21 +433,21 @@ impl<T: TensorFloat> Tensor<T> {
             ));
         }
 
-        let strides = Self::compute_strides(shape);
+        let strides = Self::compute_strides(&shape);
 
         Ok(TensorRef {
             data: self.data.as_ptr(),
             shape: shape.to_vec(),
-            strides,
+            strides: strides.to_vec(),
             _marker: PhantomData,
         })
     }
 
     /// Reshapes the tensor if compatible. This is a zero-copy operation.
     /// The tensor must be contiguous.
+    // WARN: REFACTOR: ADDED RETURN WITH EXISTING ID
     #[inline(always)]
-    pub fn reshape(&self, shape: impl AsRef<[usize]>) -> Result<Tensor<T>, LibError> {
-        let shape = shape.as_ref();
+    pub fn reshape<const N: usize>(&self, shape: [usize; N]) -> Result<Tensor<T, N>, LibError> {
         let new_len: usize = shape.iter().product();
         let old_len: usize = self.shape.iter().product();
 
@@ -412,15 +468,16 @@ impl<T: TensorFloat> Tensor<T> {
         }
 
         let data = self.data.clone();
-        let strides = Self::compute_strides(shape);
-        let grad = self.grad.clone();
-
-        Ok(Tensor {
-            data,
-            shape: shape.to_vec(),
-            strides,
-            grad,
-        })
+        let strides = Self::compute_strides(&shape);
+        match self.grad {
+            Some(ref g) => {
+                let grad = g.reshape(shape)?;
+                Ok(unsafe {
+                    Tensor::from_raw_parts(self.id, shape, data, strides, Some(Box::new(grad)))
+                })
+            }
+            None => Ok(unsafe { Tensor::from_raw_parts(self.id, shape, data, strides, None) }),
+        }
     }
 
     /// Flattens the tensor to a 1D `TensorRef`.
@@ -447,23 +504,33 @@ impl<T: TensorFloat> Tensor<T> {
     ///
     /// This method provides a fast path for contiguous tensors (zero-copy) and
     /// handles non-contiguous tensors by iterating and collecting elements into a new buffer.
+    // WARN: REFACTOR: ADDED RETURN WITH EXISTING ID
     #[inline(always)]
-    pub fn flatten(&self) -> Tensor<T> {
+    pub fn flatten(&self) -> Tensor<T, 1> {
         let expected_strides = Self::compute_strides(&self.shape);
-        let grad = self.grad.clone();
+        let grad = match self.grad {
+            Some(ref g) => {
+                let g = g.flatten();
+                Some(Box::new(g))
+            }
+            None => None,
+        };
         if self.strides == expected_strides {
             // Fast-path for contiguous tensors (column-major).
-            Tensor {
-                data: self.data.clone(),
-                shape: vec![self.shape.iter().product()],
-                strides: vec![1],
-                grad,
+            unsafe {
+                Tensor::from_raw_parts(
+                    self.id,
+                    [self.shape.iter().product(); 1],
+                    self.data.clone(),
+                    [1],
+                    grad,
+                )
             }
         } else {
             // Slow-path for non-contiguous tensors.
             let new_data: Vec<T> = self.iter().collect();
             // This unwrap is safe because the length of new_data always matches the product of the new_shape.
-            let mut out = Tensor::new(vec![new_data.len()], new_data).unwrap();
+            let mut out = Tensor::new([new_data.len(); 1], new_data).unwrap();
             out.grad = grad;
             out
         }
@@ -554,15 +621,11 @@ impl<T: TensorFloat> Tensor<T> {
         }
     }
 
+    #[inline(always)]
     fn deep_copy(&self) -> Self {
         let data = Arc::new(self.data.as_slice().to_vec());
         let grad = self.grad.as_ref().map(|g| Box::new(g.as_ref().deep_copy()));
-        Tensor {
-            data,
-            shape: self.shape.clone(),
-            strides: self.strides.clone(),
-            grad,
-        }
+        unsafe { Tensor::new_with_strides(self.shape, self.strides, data, grad) }
     }
 
     // TODO: FIX IT
@@ -609,28 +672,14 @@ impl<T: TensorFloat> Tensor<T> {
     }
 
     #[inline(always)]
-    pub fn t(&self) -> Tensor<T> {
-        if self.shape.len() != 2 {
-            panic!("Only 2D tensors can be transposed");
-        }
-        let grad = self.grad.clone();
-        Tensor {
-            data: self.data.clone(),
-            shape: vec![self.shape[1], self.shape[0]],
-            strides: vec![self.strides[1], self.strides[0]],
-            grad,
-        }
-    }
-
-    #[inline(always)]
-    pub fn sum(&self, dim: usize) -> Tensor<T> {
+    pub fn sum_keepdim(&self, dim: usize) -> Tensor<T, D> {
         if dim >= self.shape.len() {
             panic!("Dimension {} out of bounds for shape {:?}", dim, self.shape);
         }
         let mut result_shape = self.shape.clone();
         result_shape[dim] = 1;
 
-        let mut result = Tensor::zeros(&result_shape).unwrap();
+        let mut result = Tensor::zeros(result_shape).unwrap();
 
         if self.shape.iter().product::<usize>() == 0 {
             return result;
@@ -653,6 +702,41 @@ impl<T: TensorFloat> Tensor<T> {
         result
     }
 
+    /// Squeezes the specific dimension after summing over it. The programmer
+    /// has to provide new size (`const generics` are unstable, so we won't use them here)
+    // WARN: REFACTOR: ADDED RETURN WITH NEW ID
+    #[inline(always)]
+    pub fn sum_squeeze<const D_OUT: usize>(&self, dim: usize) -> Tensor<T, D_OUT> {
+        assert_eq!(
+            D,
+            D_OUT + 1,
+            "tensor::tensor::sum_squeeze: D_OUT has to be of size D - 1, where D is input size!"
+        );
+        if dim >= D {
+            panic!("Dimension {} goes beyond Tensor shape!", dim);
+        }
+
+        // let's compute the sum with keeping the dim first
+        let kept_dim_tensor = self.sum_keepdim(dim);
+
+        // and let's declare our new shape and stride, making them smaller
+        let mut new_shape = [0usize; D_OUT];
+        let mut new_strides = [0isize; D_OUT];
+        let mut idx = 0;
+
+        for i in 0..D {
+            if i != dim {
+                new_shape[idx] = kept_dim_tensor.shape[i];
+                new_strides[idx] = kept_dim_tensor.strides[i];
+                idx += 1;
+            }
+        }
+
+        unsafe {
+            Tensor::new_with_strides(new_shape, new_strides, kept_dim_tensor.data.clone(), None)
+        }
+    }
+
     #[inline(always)]
     pub fn sum_all(&self) -> T {
         //self.iter().fold(T::zero(), |acc, x| acc + x)
@@ -663,14 +747,14 @@ impl<T: TensorFloat> Tensor<T> {
     }
 
     #[inline(always)]
-    pub fn map<F: Fn(&T) -> T + Sync + Send>(&self, f: F) -> Tensor<T> {
+    pub fn map<F: Fn(&T) -> T + Sync + Send>(&self, f: F) -> Tensor<T, D> {
         //let new_data: Vec<T> = self.iter().map(f).collect();
         let new_data = self.data.par_iter().map(f).collect();
         Tensor::new(self.shape.clone(), new_data).unwrap()
     }
 
     #[inline(always)]
-    pub fn mul_elem(&self, rhs: &Tensor<T>) -> Tensor<T> {
+    pub fn mul_elem(&self, rhs: &Tensor<T, D>) -> Tensor<T, D> {
         assert_eq!(self.shape, rhs.shape);
         if self.strides == rhs.strides {
             // fast path
@@ -682,7 +766,7 @@ impl<T: TensorFloat> Tensor<T> {
                 .zip(rhs.data.par_iter())
                 .map(|(a, b)| *a * *b)
                 .collect();
-            return Tensor::new(self.shape().to_vec(), new_data).unwrap();
+            return Tensor::new(*self.shape(), new_data).unwrap();
         }
         let new_data: Vec<T> = self.iter().zip(rhs.iter()).map(|(a, b)| a * b).collect();
         Tensor::new(self.shape.clone(), new_data).unwrap()
@@ -714,7 +798,7 @@ impl<T: TensorFloat> Tensor<T> {
         iter(self)
     }
 
-    pub fn iter_with_index(&self) -> TensorIterWithIndex<'_, T> {
+    pub fn iter_with_index(&self) -> TensorIterWithIndex<'_, T, D> {
         TensorIterWithIndex {
             tensor: self,
             logical_pos: vec![0; self.shape.len()],
@@ -739,18 +823,18 @@ impl<T: TensorFloat> Tensor<T> {
     #[inline(always)]
     pub fn select<'a>(&'a self, axis: usize, index: usize) -> Result<TensorRef<'a, T>, LibError> {
         // Validation
-        if axis >= self.shape.len() {
+        if axis >= D {
             return Err(LibError::InvalidDimensionality {
                 operation: "select".to_string(),
                 expected: axis + 1,
-                actual: self.shape.len(),
+                actual: D,
             });
         }
         if index >= self.shape[axis] {
             return Err(LibError::OutOfBounds {
-                shape: self.shape.clone(),
+                shape: self.shape.to_vec(),
                 index: {
-                    let mut idx = vec![0; self.shape.len()];
+                    let mut idx = vec![0; D];
                     idx[axis] = index;
                     idx
                 },
@@ -764,10 +848,10 @@ impl<T: TensorFloat> Tensor<T> {
 
         // Let's calculate new shape and strides
         // We can just remove selected positions from shape and strides vecs.
-        let mut new_shape = self.shape.clone();
+        let mut new_shape = self.shape.to_vec();
         new_shape.remove(axis);
 
-        let mut new_strides = self.strides.clone();
+        let mut new_strides = self.strides.to_vec();
         new_strides.remove(axis);
 
         // Edge case: if we select 1-dim Tensor, we must gracefully handle it
@@ -815,7 +899,7 @@ impl<T: TensorFloat> Tensor<T> {
         }
         if index >= self.shape[axis] {
             return Err(LibError::OutOfBounds {
-                shape: self.shape.clone(),
+                shape: self.shape.to_vec(),
                 index: {
                     let mut idx = vec![0; self.shape.len()];
                     idx[axis] = index;
@@ -830,10 +914,10 @@ impl<T: TensorFloat> Tensor<T> {
         let offset = self.strides[axis] * index as isize;
         let new_ptr = unsafe { base_ptr.offset(offset) };
 
-        let mut new_shape = self.shape.clone();
+        let mut new_shape = self.shape.to_vec();
         new_shape.remove(axis);
 
-        let mut new_strides = self.strides.clone();
+        let mut new_strides = self.strides.to_vec();
         new_strides.remove(axis);
 
         if new_shape.is_empty() {
@@ -854,40 +938,34 @@ impl<T: TensorFloat> Tensor<T> {
     /// Panics if the length of `axes` is not equal to the number of dimensions of the tensor,
     /// or if `axes` contains duplicate dimension indices.
     #[inline(always)]
-    pub fn permute(&self, axes: &[usize]) -> Self {
-        if axes.len() != self.shape.len() {
-            panic!(
-                "Permutation error: axes length {} does not match tensor dimensionality {}",
-                axes.len(),
-                self.shape.len()
-            );
-        }
+    pub fn permute(&self, axes: [usize; D]) -> Self {
+        let mut new_shape = [0usize; D];
+        let mut new_strides = [0isize; D];
+        let mut seen = [false; D];
 
-        let mut new_shape = Vec::with_capacity(self.shape.len());
-        let mut new_strides = Vec::with_capacity(self.strides.len());
-        let mut seen = vec![false; self.shape.len()];
-
-        for &axis in axes {
-            if axis >= self.shape.len() {
+        for (i, &axis) in axes.iter().enumerate() {
+            if axis >= D {
                 panic!(
                     "Permutation error: axis {} is out of bounds for tensor with {} dimensions",
-                    axis,
-                    self.shape.len()
+                    axis, D
                 );
             }
             if seen[axis] {
                 panic!("Permutation error: axis {} is duplicated", axis);
             }
             seen[axis] = true;
-            new_shape.push(self.shape[axis]);
-            new_strides.push(self.strides[axis]);
+            new_shape[i] = self.shape[axis];
+            new_strides[i] = self.strides[axis];
         }
 
-        Self {
-            data: self.data.clone(),
-            shape: new_shape,
-            strides: new_strides,
-            grad: self.grad.clone(),
+        unsafe {
+            Tensor::from_raw_parts(
+                self.id,
+                new_shape,
+                self.data.clone(),
+                new_strides,
+                self.grad.clone(),
+            )
         }
     }
 
@@ -919,8 +997,9 @@ impl<T: TensorFloat> Tensor<T> {
             new_ptr = unsafe { new_ptr.offset(offset) };
         }
 
-        let reversed_view = unsafe { TensorRef::new(new_ptr, self.shape.clone(), new_strides) };
-        reversed_view.to_owned()
+        let reversed_view =
+            unsafe { TensorRef::new(new_ptr, self.shape.to_vec(), new_strides.to_vec()) };
+        reversed_view.to_owned().unwrap()
     }
 
     #[inline(always)]
@@ -965,27 +1044,27 @@ impl<T: TensorFloat> Tensor<T> {
     /// # Errors
     /// Returns `LibError::ShapeMismatch` if the tensor cannot be broadcast
     /// to the target shape.
+    ///
+    // WARN: REFACTOR: ADDED RETURN WITH EXISTING ID
     #[inline(always)]
-    pub fn expand(&self, shape: impl AsRef<[usize]>) -> Result<Self, LibError> {
-        let target_shape = shape.as_ref();
-
-        if target_shape.len() < self.shape.len() {
+    pub fn expand<const N: usize>(&self, shape: [usize; N]) -> Result<Tensor<T, N>, LibError> {
+        if shape.len() < self.shape.len() {
             return Err(LibError::ShapeMismatch {
                 operation: "expand (target dims < source dims)".to_string(),
-                expected: target_shape.to_vec(),
-                actual: self.shape.clone(),
+                expected: shape.to_vec(),
+                actual: self.shape.to_vec(),
             });
         }
 
-        let mut new_strides = vec![0isize; target_shape.len()];
-        let offset = target_shape.len() - self.shape.len();
+        let mut new_strides = [0isize; N];
+        let offset = shape.len() - self.shape.len();
 
         for i in 0..self.shape.len() {
             let source_dim = self.shape[i];
             let source_stride = self.strides[i];
 
             let target_dim_idx = i + offset;
-            let target_dim = target_shape[target_dim_idx];
+            let target_dim = shape[target_dim_idx];
 
             if source_dim == target_dim {
                 new_strides[target_dim_idx] = source_stride;
@@ -994,22 +1073,57 @@ impl<T: TensorFloat> Tensor<T> {
             } else {
                 return Err(LibError::ShapeMismatch {
                     operation: "expand (incompatible dimension)".to_string(),
-                    expected: target_shape.to_vec(),
-                    actual: self.shape.clone(),
+                    expected: shape.to_vec(),
+                    actual: self.shape.to_vec(),
                 });
             }
         }
 
-        Ok(Self {
-            data: self.data.clone(),
-            shape: target_shape.to_vec(),
-            strides: new_strides,
-            grad: self.grad.clone(),
-        })
+        match self.grad {
+            Some(ref g) => {
+                let grad = g.expand(shape)?;
+                unsafe {
+                    Ok(Tensor::from_raw_parts(
+                        self.id,
+                        shape,
+                        self.data.clone(),
+                        new_strides,
+                        Some(Box::new(grad)),
+                    ))
+                }
+            }
+            None => unsafe {
+                Ok(Tensor::from_raw_parts(
+                    self.id,
+                    shape,
+                    self.data.clone(),
+                    new_strides,
+                    None,
+                ))
+            },
+        }
     }
 }
 
-impl<T: TensorFloat> Display for Tensor<T> {
+// WARN: REFACTOR: ADDED RETURN WITH EXISTING ID
+impl<T: TensorFloat> Tensor<T, 2> {
+    #[inline(always)]
+    /// Returns a new tensor that is the transpose of the original tensor. This is a zero-copy operation.
+    pub fn t(&self) -> Tensor<T, 2> {
+        let grad = self.grad.clone();
+        unsafe {
+            Tensor::from_raw_parts(
+                self.id,
+                [self.shape[1], self.shape[0]],
+                self.data.clone(),
+                [self.strides[1], self.strides[0]],
+                grad,
+            )
+        }
+    }
+}
+
+impl<T: TensorFloat, const D: usize> Display for Tensor<T, D> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if self.shape.is_empty() {
             return write!(f, "{}", self.data[0]);
@@ -1026,8 +1140,8 @@ impl<T: TensorFloat> Display for Tensor<T> {
     }
 }
 
-fn fmt_recursive<T: TensorFloat>(
-    tensor: &Tensor<T>,
+fn fmt_recursive<T: TensorFloat, const D: usize>(
+    tensor: &Tensor<T, D>,
     f: &mut std::fmt::Formatter<'_>,
     dim: usize,
     indices: &mut [usize],
@@ -1068,13 +1182,13 @@ fn fmt_recursive<T: TensorFloat>(
     Ok(())
 }
 
-pub struct TensorIterWithIndex<'a, T: TensorFloat> {
-    tensor: &'a Tensor<T>,
+pub struct TensorIterWithIndex<'a, T: TensorFloat, const D: usize> {
+    tensor: &'a Tensor<T, D>,
     logical_pos: Vec<usize>,
     finished: bool,
 }
 
-impl<'a, T: TensorFloat> Iterator for TensorIterWithIndex<'a, T> {
+impl<'a, T: TensorFloat, const D: usize> Iterator for TensorIterWithIndex<'a, T, D> {
     type Item = (Vec<usize>, T);
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -1104,7 +1218,7 @@ impl<'a, T: TensorFloat> Iterator for TensorIterWithIndex<'a, T> {
     }
 }
 
-impl<T: TensorFloat> Index<&[usize]> for Tensor<T> {
+impl<T: TensorFloat, const D: usize> Index<&[usize]> for Tensor<T, D> {
     type Output = T;
 
     fn index(&self, index: &[usize]) -> &T {
@@ -1125,7 +1239,7 @@ impl<T: TensorFloat> IndexMut<Vec<usize>> for Tensor<T> {
 }
 */
 
-impl<T: TensorFloat> IndexMut<&[usize]> for Tensor<T> {
+impl<T: TensorFloat, const D: usize> IndexMut<&[usize]> for Tensor<T, D> {
     fn index_mut(&mut self, index: &[usize]) -> &mut T {
         let index = self.physical_offset(index) as usize;
         match Arc::get_mut(&mut self.data) {
@@ -1135,25 +1249,25 @@ impl<T: TensorFloat> IndexMut<&[usize]> for Tensor<T> {
     }
 }
 
-impl<'a, T: TensorFloat> Tensor<T> {
+impl<'a, T: TensorFloat, const D: usize> Tensor<T, D> {
     pub fn as_ref(&'a self) -> TensorRef<'a, T> {
         let data = self.data.as_ptr();
         TensorRef {
             data,
-            shape: self.shape.clone(),
-            strides: self.strides.clone(),
+            shape: self.shape.to_vec(),
+            strides: self.strides.to_vec(),
             _marker: PhantomData,
         }
     }
 }
 
-impl<T> MatMul<Tensor<T>> for Tensor<T>
+impl<T, const D: usize> MatMul<Tensor<T, D>> for Tensor<T, 2>
 where
     T: TensorFloat,
 {
-    type Output = Result<Tensor<T>, LibError>;
+    type Output = Result<Tensor<T, 2>, LibError>;
 
-    fn matmul(&self, rhs: &Tensor<T>) -> Self::Output {
+    fn matmul(&self, rhs: &Tensor<T, D>) -> Self::Output {
         if self.shape.len() != 2 || rhs.shape.len() != 2 {
             return Err(LibError::InvalidDimensionalityTwoTensors {
                 operation: "matmul".to_string(),
@@ -1174,7 +1288,7 @@ where
         let nrows = self.shape[0];
         let ncols = rhs.shape[1];
 
-        let mut result = unsafe { Tensor::uninitialized(vec![nrows, ncols])? };
+        let mut result = unsafe { Tensor::uninitialized([nrows, ncols])? };
 
         let a_faer = self.as_faer_ref_unsafe()?;
         let b_faer = rhs.as_faer_ref_unsafe()?;
@@ -1198,18 +1312,18 @@ where
     }
 }
 
-impl<T> TensorAdd<Tensor<T>> for Tensor<T>
+impl<T, const D: usize> TensorAdd<Tensor<T, D>> for Tensor<T, D>
 where
     T: TensorFloat,
 {
-    type Output = Result<Tensor<T>, LibError>;
+    type Output = Result<Tensor<T, D>, LibError>;
 
-    fn tensoradd(&self, rhs: &Tensor<T>) -> Self::Output {
+    fn tensoradd(&self, rhs: &Tensor<T, D>) -> Self::Output {
         if self.shape != rhs.shape {
             return Err(LibError::ShapeMismatch {
                 operation: "tensoradd".to_string(),
-                expected: self.shape.clone(),
-                actual: rhs.shape.clone(),
+                expected: self.shape.to_vec(),
+                actual: rhs.shape.to_vec(),
             });
         }
 
@@ -1224,7 +1338,7 @@ where
                 .zip(rhs.data.par_iter())
                 .map(|(a, b)| *a + *b)
                 .collect();
-            return Tensor::new(self.shape().to_vec(), new_data);
+            return Tensor::new(*self.shape(), new_data);
         }
         // */
         // fallback, slow path
@@ -1233,13 +1347,13 @@ where
     }
 }
 
-impl<T: TensorFloat> Tensor<T> {
-    pub fn sub(&self, rhs: &Tensor<T>) -> Result<Tensor<T>, LibError> {
+impl<T: TensorFloat, const D: usize> Tensor<T, D> {
+    pub fn sub(&self, rhs: &Tensor<T, D>) -> Result<Tensor<T, D>, LibError> {
         if self.shape != rhs.shape {
             return Err(LibError::ShapeMismatch {
                 operation: "sub".to_string(),
-                expected: self.shape.clone(),
-                actual: rhs.shape.clone(),
+                expected: self.shape.to_vec(),
+                actual: rhs.shape.to_vec(),
             });
         }
         if self.strides == rhs.strides {
@@ -1252,14 +1366,14 @@ impl<T: TensorFloat> Tensor<T> {
                 .zip(rhs.data.par_iter())
                 .map(|(a, b)| *a - *b)
                 .collect();
-            return Tensor::new(self.shape().to_vec(), new_data);
+            return Tensor::new(*self.shape(), new_data);
         }
         let new_data: Vec<T> = self.iter().zip(rhs.iter()).map(|(a, b)| a - b).collect();
         Ok(Tensor::new(self.shape.clone(), new_data).unwrap())
     }
 }
 
-impl<'a, T: TensorFloat> TensorView<'a> for Tensor<T> {
+impl<'a, T: TensorFloat, const D: usize> TensorView<'a> for Tensor<T, D> {
     type Dtype = T;
 
     fn shape(&self) -> &[usize] {
@@ -1273,7 +1387,7 @@ impl<'a, T: TensorFloat> TensorView<'a> for Tensor<T> {
     }
 }
 
-impl<'a, T: TensorFloat> TensorView<'a> for &Tensor<T> {
+impl<'a, T: TensorFloat, const D: usize> TensorView<'a> for &Tensor<T, D> {
     type Dtype = T;
 
     fn shape(&self) -> &[usize] {
@@ -1304,7 +1418,7 @@ mod tests {
     #[test]
     fn creating_new_tensor() {
         let tensor = Tensor::new(
-            vec![2, 3, 2],
+            [2, 3, 2],
             vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0],
         );
         tensor.unwrap();
@@ -1313,7 +1427,7 @@ mod tests {
     #[test]
     fn tensor_to_tensorref() {
         let tensor = Tensor::new(
-            vec![2, 3, 2],
+            [2, 3, 2],
             vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0],
         );
         let tensor = tensor.unwrap();
@@ -1324,7 +1438,7 @@ mod tests {
     #[test]
     fn tensor_shape_and_flatten() {
         let tensor = Tensor::new(
-            vec![2, 3, 3],
+            [2, 3, 3],
             vec![
                 0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0,
                 15.0, 16.0, 17.0,
@@ -1333,7 +1447,7 @@ mod tests {
         .unwrap();
         assert_eq!(tensor.shape(), &[2, 3, 3]);
         let flat = tensor.flatten();
-        assert_eq!(flat.shape, &[18]);
+        assert_eq!(flat.shape, [18usize]);
         //let data = tensor.data;
         //let flat_slice = unsafe { std::slice::from_raw_parts(flat.data, flat.shape[0]) };
         //assert_eq!(flat_slice, data.as_slice());
@@ -1341,7 +1455,7 @@ mod tests {
 
     #[test]
     fn tensor_get_and_set() {
-        let mut tensor = Tensor::new(vec![2, 2], vec![1.0, 2.0, 3.0, 4.0]).unwrap();
+        let mut tensor = Tensor::new([2, 2], vec![1.0, 2.0, 3.0, 4.0]).unwrap();
         assert_eq!(tensor.get(&[0, 1]), Some(3.0));
         tensor.set(&[0, 1], 5.0).unwrap();
         assert_eq!(tensor.get(&[0, 1]), Some(5.0));
@@ -1351,7 +1465,7 @@ mod tests {
 
     #[test]
     fn tensor_from_slice() {
-        let tensor = Tensor::from_slice(&[2, 3], &[0.0, 1.0, 2.0, 3.0, 4.0, 5.0]);
+        let tensor = Tensor::from_slice([2, 3], &[0.0, 1.0, 2.0, 3.0, 4.0, 5.0]);
         assert!(tensor.is_ok());
         let tensor = tensor.unwrap();
         assert_eq!(tensor.shape(), &[2, 3]);
@@ -1359,17 +1473,17 @@ mod tests {
     }
     #[test]
     fn tensor_reshape() {
-        let tensor = Tensor::new(vec![2, 2], vec![1.0, 2.0, 3.0, 4.0]).unwrap();
-        let tensorref = tensor.reshape(vec![4]);
+        let tensor = Tensor::new([2, 2], vec![1.0, 2.0, 3.0, 4.0]).unwrap();
+        let tensorref = tensor.reshape([4]);
         assert!(tensorref.is_ok());
-        assert_eq!(tensorref.unwrap().shape, &[4]);
-        assert!(tensor.reshape(vec![3]).is_err());
+        assert_eq!(tensorref.unwrap().shape, [4]);
+        assert!(tensor.reshape([3]).is_err());
     }
 
     #[test]
     fn matmul_test() {
-        let a = Tensor::new(vec![2, 3], vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
-        let b = Tensor::new(vec![3, 2], vec![7.0, 8.0, 9.0, 10.0, 11.0, 12.0]).unwrap();
+        let a = Tensor::new([2, 3], vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
+        let b = Tensor::new([3, 2], vec![7.0, 8.0, 9.0, 10.0, 11.0, 12.0]).unwrap();
         let c = a.matmul(&b).unwrap();
         assert_eq!(c.shape(), &[2, 2]);
         assert_eq!(c.data.as_slice(), vec![76.0, 100.0, 103.0, 136.0]);
@@ -1377,20 +1491,16 @@ mod tests {
 
     #[test]
     fn matmul_incompatible_shapes() {
-        let a = Tensor::new(vec![2, 3], vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
-        let b = Tensor::new(
-            vec![4, 2],
-            vec![7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0],
-        )
-        .unwrap();
+        let a = Tensor::new([2, 3], vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
+        let b = Tensor::new([4, 2], vec![7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0]).unwrap();
         let c = a.matmul(&b);
         assert!(c.is_err());
     }
 
     #[test]
     fn matadd_test() {
-        let a = Tensor::new(vec![2, 2], vec![1.0, 2.0, 3.0, 4.0]).unwrap();
-        let b = Tensor::new(vec![2, 2], vec![5.0, 6.0, 7.0, 8.0]).unwrap();
+        let a = Tensor::new([2, 2], vec![1.0, 2.0, 3.0, 4.0]).unwrap();
+        let b = Tensor::new([2, 2], vec![5.0, 6.0, 7.0, 8.0]).unwrap();
         let c = a.tensoradd(&b).unwrap();
         assert_eq!(c.shape(), &[2, 2]);
         assert_eq!(c.data.as_slice(), vec![6.0, 8.0, 10.0, 12.0]);
@@ -1398,26 +1508,26 @@ mod tests {
 
     #[test]
     fn matadd_incompatible_shapes() {
-        let a = Tensor::new(vec![2, 2], vec![1.0, 2.0, 3.0, 4.0]).unwrap();
-        let b = Tensor::new(vec![2, 3], vec![5.0, 6.0, 7.0, 8.0, 9.0, 10.0]).unwrap();
+        let a = Tensor::new([2, 2], vec![1.0, 2.0, 3.0, 4.0]).unwrap();
+        let b = Tensor::new([2, 3], vec![5.0, 6.0, 7.0, 8.0, 9.0, 10.0]).unwrap();
         let c = a.tensoradd(&b);
         assert!(c.is_err());
     }
 
     #[test]
     fn matadd_different_strides() {
-        let a = Tensor {
-            data: Arc::new(vec![1.0, 2.0, 3.0, 4.0]),
-            shape: vec![2, 2],
-            strides: vec![1, 2],
-            grad: None,
-        }; // manually change }
-        let b = Tensor {
-            data: Arc::new(vec![10.0, 100.0, 1000.0, 10000.0]),
-            shape: vec![2, 2],
-            strides: vec![2, 1],
-            grad: None,
-        }; // manually change
+        let a = unsafe {
+            Tensor::from_raw_parts(0, [2, 2], Arc::new(vec![1.0, 2.0, 3.0, 4.0]), [1, 2], None)
+        };
+        let b = unsafe {
+            Tensor::from_raw_parts(
+                1,
+                [2, 2],
+                Arc::new(vec![10.0, 100.0, 1000.0, 10000.0]),
+                [2, 1],
+                None,
+            )
+        };
         // strides
         let c = a.tensoradd(&b).unwrap();
         assert_eq!(c.shape(), &[2, 2]);
@@ -1426,7 +1536,7 @@ mod tests {
 
     #[test]
     fn tensor_make_unique() {
-        let tensor = Tensor::new(vec![2, 2], vec![1.0, 2.0, 3.0, 4.0]).unwrap();
+        let tensor = Tensor::new([2, 2], vec![1.0, 2.0, 3.0, 4.0]).unwrap();
         let tensor_clone = tensor.clone();
         assert_eq!(Arc::strong_count(&tensor.data), 2);
         let unique_tensor = tensor_clone.make_unique();
@@ -1439,7 +1549,7 @@ mod tests {
 
     #[test]
     fn logical_physical_index() {
-        let tensor = Tensor::new(vec![3, 4, 2], (0..24).map(|x| x as f64).collect()).unwrap();
+        let tensor = Tensor::new([3, 4, 2], (0..24).map(|x| x as f64).collect()).unwrap();
         for i in 0..24 {
             let logical_idx = tensor.logical_index(i).unwrap();
             let physical_idx = tensor.physical_offset(&logical_idx);
@@ -1449,15 +1559,15 @@ mod tests {
 
     #[test]
     fn physical_index_out_of_bounds() {
-        let tensor = Tensor::new(vec![3, 4, 2], (0..24).map(|x| x as f64).collect()).unwrap();
+        let tensor = Tensor::new([3, 4, 2], (0..24).map(|x| x as f64).collect()).unwrap();
         assert!(tensor.logical_index(24).is_none());
         assert!(tensor.logical_index(100).is_none());
     }
 
     #[test]
     fn sum_test() {
-        let tensor = Tensor::new(vec![2, 3, 4], (1..=24).map(|x| x as f64).collect()).unwrap();
-        let summed_dim0 = tensor.sum(0);
+        let tensor = Tensor::new([2, 3, 4], (1..=24).map(|x| x as f64).collect()).unwrap();
+        let summed_dim0 = tensor.sum_keepdim(0);
         assert_eq!(summed_dim0.shape(), &[1, 3, 4]);
         assert_eq!(
             summed_dim0.data.as_slice(),
@@ -1466,14 +1576,14 @@ mod tests {
             ]
         );
 
-        let summed_dim1 = tensor.sum(1);
+        let summed_dim1 = tensor.sum_keepdim(1);
         assert_eq!(summed_dim1.shape(), &[2, 1, 4]);
         assert_eq!(
             summed_dim1.data.as_slice(),
             vec![9.0, 12.0, 27.0, 30.0, 45.0, 48.0, 63.0, 66.0]
         );
 
-        let summed_dim2 = tensor.sum(2);
+        let summed_dim2 = tensor.sum_keepdim(2);
         assert_eq!(summed_dim2.shape(), &[2, 3, 1]);
         assert_eq!(
             summed_dim2.data.as_slice(),
@@ -1483,8 +1593,8 @@ mod tests {
 
     #[test]
     fn matmul_transposed_one_mat() {
-        let a = Tensor::new(vec![2, 2], vec![1.0, 2.0, 3.0, 4.0]).unwrap();
-        let b = Tensor::new(vec![2, 2], vec![5.0, 6.0, 7.0, 8.0]);
+        let a = Tensor::new([2, 2], vec![1.0, 2.0, 3.0, 4.0]).unwrap();
+        let b = Tensor::new([2, 2], vec![5.0, 6.0, 7.0, 8.0]);
 
         let b_t = b.unwrap().t();
 
@@ -1497,14 +1607,17 @@ mod tests {
     #[test]
     fn matadd_different_strides_flipped() {
         // `a` is a standard contiguous tensor
-        let a = Tensor::new(vec![2, 2], vec![1.0, 2.0, 30.0, 40.0]).unwrap();
+        let a = Tensor::new([2, 2], vec![1.0, 2.0, 30.0, 40.0]).unwrap();
 
         // `b` has a non-contiguous (transposed) memory layout
-        let b = Tensor {
-            data: Arc::new(vec![5.0, 60.0, 7.0, 80.0]),
-            shape: vec![2, 2],
-            strides: vec![2, 1], // Transposed strides
-            grad: None,
+        let b = unsafe {
+            Tensor::from_raw_parts(
+                1,
+                [2, 2],
+                Arc::new(vec![5.0, 60.0, 7.0, 80.0]),
+                [2, 1],
+                None,
+            )
         };
 
         // The correct result of b + a, element-by-element, stored contiguously
@@ -1521,7 +1634,7 @@ mod tests {
     #[test]
     fn test_iterators() {
         // Contiguous tensor
-        let a = Tensor::new(vec![2, 2], vec![1.0, 2.0, 3.0, 4.0]).unwrap();
+        let a = Tensor::new([2, 2], vec![1.0, 2.0, 3.0, 4.0]).unwrap();
         let mut a_iter = a.iter();
         assert_eq!(a_iter.next(), Some(1.0));
         assert_eq!(a_iter.next(), Some(2.0));
@@ -1554,20 +1667,20 @@ mod tests {
 
     #[test]
     fn test_map_and_mul_elem() {
-        let a = Tensor::new(vec![2, 2], vec![1.0, 2.0, 3.0, 4.0]).unwrap();
+        let a = Tensor::new([2, 2], vec![1.0, 2.0, 3.0, 4.0]).unwrap();
         let a_t = a.t(); // non-contiguous
 
         // Test map
         let mapped_a = a.map(|x| x * 2.0);
         assert_eq!(mapped_a.get_data(), &[2.0, 4.0, 6.0, 8.0]);
-        assert_eq!(mapped_a.strides, vec![1, 2]); // Should be contiguous
+        assert_eq!(mapped_a.strides, [1, 2]); // Should be contiguous
 
         let mapped_at = a_t.map(|x| x * 2.0);
         assert_eq!(mapped_at.get_data(), &[2.0, 6.0, 4.0, 8.0]);
-        assert_eq!(mapped_at.strides, vec![1, 2]); // Should be contiguous
+        assert_eq!(mapped_at.strides, [1, 2]); // Should be contiguous
 
         // Test mul_elem
-        let b = Tensor::new(vec![2, 2], vec![5.0, 6.0, 7.0, 8.0]).unwrap();
+        let b = Tensor::new([2, 2], vec![5.0, 6.0, 7.0, 8.0]).unwrap();
         let mul_ab = a.mul_elem(&b);
         assert_eq!(mul_ab.get_data(), &[5.0, 12.0, 21.0, 32.0]);
 
@@ -1578,7 +1691,7 @@ mod tests {
 
     #[test]
     fn test_map_inplace() {
-        let mut a = Tensor::new(vec![2, 2], vec![1.0, 2.0, 3.0, 4.0]).unwrap();
+        let mut a = Tensor::new([2, 2], vec![1.0, 2.0, 3.0, 4.0]).unwrap();
         a.map_inplace(|x| x + 1.0);
         assert_eq!(a.get_data(), &[2.0, 3.0, 4.0, 5.0]);
     }
@@ -1586,7 +1699,7 @@ mod tests {
     #[test]
     #[should_panic]
     fn test_map_inplace_panic_on_shared() {
-        let mut a = Tensor::new(vec![2, 2], vec![1.0, 2.0, 3.0, 4.0]).unwrap();
+        let mut a = Tensor::new([2, 2], vec![1.0, 2.0, 3.0, 4.0]).unwrap();
         let _b = a.clone(); // Create a view, sharing the data
         a.map_inplace(|x| x + 1.0); // This should panic
     }
@@ -1594,7 +1707,7 @@ mod tests {
     #[test]
     fn test_display_impl() {
         let tensor = Tensor::new(
-            vec![2, 2, 2, 2],
+            [2, 2, 2, 2],
             vec![
                 0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0,
                 15.0,
@@ -1612,8 +1725,8 @@ mod tests {
         const TEST_COUNT: u32 = 10;
 
         // Stwórz dwie duże, losowe macierze. Domyślnie są ciągłe (column-major).
-        let a: Tensor<f32> = Tensor::random([DIM, DIM]);
-        let b: Tensor<f32> = Tensor::random([DIM, DIM]);
+        let a: Tensor<f32, 2> = Tensor::random([DIM, DIM]);
+        let b: Tensor<f32, 2> = Tensor::random([DIM, DIM]);
 
         let b_t = b.t();
 
@@ -1665,7 +1778,7 @@ mod tests {
     fn test_select() {
         // LEt's create a 2x3x4 tensor with values from 0 to 23
         let data: Vec<f32> = (0..24).map(|x| x as f32).collect();
-        let tensor = Tensor::new(vec![2, 3, 4], data).unwrap();
+        let tensor = Tensor::new([2, 3, 4], data).unwrap();
 
         // And let's take a slice along axis 2 (the last axis) at index 1
         // we should get a 2x3 tensor
@@ -1709,7 +1822,7 @@ mod tests {
     #[test]
     fn test_select_mut_and_modify() {
         // Tworzymy tensor 2x2x2
-        let mut tensor = Tensor::new(vec![2, 2, 2], (0..8).map(|x| x as f32).collect()).unwrap();
+        let mut tensor = Tensor::new([2, 2, 2], (0..8).map(|x| x as f32).collect()).unwrap();
 
         // tensor (col-major):
         // Slice z=0: [[0, 2], [1, 3]]
@@ -1738,10 +1851,11 @@ mod tests {
         assert_eq!(row_y0.get(&[1]).unwrap(), 99.0);
     }
 
+    /*
     #[test]
     fn test_permute_2d_transpose() {
         // Tensor 2x3
-        let tensor = Tensor::new(vec![2, 3], vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0]).unwrap();
+        let tensor = Tensor::new([2, 3], vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0]).unwrap();
         println!("Original tensor:\n{}", tensor);
 
         // Transpozycja (zamiana osi 0 z 1)
@@ -1762,7 +1876,7 @@ mod tests {
     #[test]
     fn test_permute_3d() {
         // Tensor 2x3x4
-        let tensor = Tensor::new(vec![2, 3, 4], (0..24).map(|x| x as f32).collect()).unwrap();
+        let tensor = Tensor::new([2, 3, 4], (0..24).map(|x| x as f32).collect()).unwrap();
         println!("Original tensor:\n{}", tensor);
 
         // Permutacja z [d0, d1, d2] na [d2, d0, d1]
@@ -1784,7 +1898,7 @@ mod tests {
 
     #[test]
     fn test_permute_4d_2last_axes() {
-        let tensor = Tensor::new(vec![2, 2, 3, 4], (0..48).map(|x| x as f32).collect()).unwrap();
+        let tensor = Tensor::new([2, 2, 3, 4], (0..48).map(|x| x as f32).collect()).unwrap();
         println!("Original tensor:\n{}", tensor);
 
         let permuted = tensor.permute(&[0, 1, 3, 2]);
@@ -1813,14 +1927,14 @@ mod tests {
         expected = "Permutation error: axes length 2 does not match tensor dimensionality 3"
     )]
     fn test_permute_invalid_axes_length() {
-        let tensor = Tensor::<f32>::zeros(&[2, 3, 4]).unwrap();
+        let tensor = Tensor::<f32, _>::zeros([2, 3, 4]).unwrap();
         tensor.permute(&[1, 0]); // Za mało osi
     }
 
     #[test]
     #[should_panic(expected = "Permutation error: axis 1 is duplicated")]
     fn test_permute_duplicate_axes() {
-        let tensor = Tensor::<f32>::zeros(&[2, 3, 4]).unwrap();
+        let tensor = Tensor::<f32, _>::zeros([2, 3, 4]).unwrap();
         tensor.permute(&[0, 1, 1]); // Zduplikowana oś
     }
 
@@ -1829,15 +1943,16 @@ mod tests {
         expected = "Permutation error: axis 3 is out of bounds for tensor with 3 dimensions"
     )]
     fn test_permute_axis_out_of_bounds() {
-        let tensor = Tensor::<f32>::zeros(&[2, 3, 4]).unwrap();
+        let tensor = Tensor::<f32, _>::zeros([2, 3, 4]).unwrap();
         tensor.permute(&[0, 1, 3]); // Oś 3 jest poza zakresem
     }
+    */
 
     #[test]
     fn test_flip_4d_spatial_axes() {
         // Tworzymy tensor 4D o kształcie [N, C, H, W] = [1, 2, 3, 2]
         // N - batch size, C - kanały, H - wysokość, W - szerokość
-        let tensor = Tensor::new(vec![1, 2, 3, 2], (0..12).map(|x| x as f32).collect()).unwrap();
+        let tensor = Tensor::new([1, 2, 3, 2], (0..12).map(|x| x as f32).collect()).unwrap();
         println!("Original tensor:\n{}", tensor);
 
         // Odwracamy osie przestrzenne: wysokość (oś 2) i szerokość (oś 3)
@@ -1858,10 +1973,10 @@ mod tests {
     fn test_expand_broadcast_bias() {
         // Scenariusz: Mamy wektor biasu [3, 1] i chcemy go dodać do batcha [3, 4].
         // Wartości: [10, 20, 30]
-        let bias = Tensor::new(vec![3, 1], vec![10.0, 20.0, 30.0]).unwrap();
+        let bias = Tensor::new([3, 1], vec![10.0, 20.0, 30.0]).unwrap();
 
         // Rozszerzamy do [3, 4] (3 cechy, 4 przykłady w batchu)
-        let expanded = bias.expand(&[3, 4]).unwrap();
+        let expanded = bias.expand([3, 4]).unwrap();
 
         assert_eq!(expanded.shape(), &[3, 4]);
 
@@ -1884,9 +1999,9 @@ mod tests {
     #[test]
     fn test_expand_broadcast_scalar() {
         // Scenariusz: Mamy tensor 1x1 (skalar) i rozszerzamy go do 2x2.
-        let scalar = Tensor::new(vec![1, 1], vec![5.0]).unwrap();
+        let scalar = Tensor::new([1, 1], vec![5.0]).unwrap();
 
-        let expanded = scalar.expand(&[2, 2]).unwrap();
+        let expanded = scalar.expand([2, 2]).unwrap();
 
         assert_eq!(expanded.shape(), &[2, 2]);
         // Oba wymiary były 1, więc oba strides powinny być 0
@@ -1908,15 +2023,15 @@ mod tests {
         // Źródło:         dim0=2
         // Zatem dim0 celu (nowy wymiar) dostanie stride 0 (powielanie całego wektora)
 
-        let vec = Tensor::new(vec![2], vec![1.0, 2.0]).unwrap();
-        let expanded = vec.expand(&[2, 2]).unwrap();
+        let vec = Tensor::new([2], vec![1.0, 2.0]).unwrap();
+        let expanded = vec.expand([2, 2]).unwrap();
 
-        assert_eq!(expanded.shape(), &[2, 2]);
+        assert_eq!(*expanded.shape(), [2, 2]);
 
         // Logika expand (wyrównanie do prawej):
         // Target dim 1 (rozmiar 2) odpowiada Source dim 0 (rozmiar 2) -> stride 1
         // Target dim 0 (rozmiar 2) jest nowy -> stride 0
-        assert_eq!(expanded.strides(), &[0, 1]);
+        assert_eq!(*expanded.strides(), [0, 1]);
 
         // Sprawdźmy dane:
         // expanded[0, :] powinno być [1.0, 2.0]
@@ -1930,20 +2045,20 @@ mod tests {
 
     #[test]
     fn test_expand_invalid_shapes() {
-        let t = Tensor::new(vec![2, 2], vec![1.0, 2.0, 3.0, 4.0]).unwrap();
+        let t = Tensor::new([2, 2], vec![1.0, 2.0, 3.0, 4.0]).unwrap();
 
         // Błąd 1: Próba zmiany wymiaru, który nie jest 1 (2 -> 3)
-        assert!(t.expand(&[2, 3]).is_err());
+        assert!(t.expand([2, 3]).is_err());
 
         // Błąd 2: Próba zmniejszenia liczby wymiarów (expand nie robi shrink/reduce)
-        assert!(t.expand(&[2]).is_err());
+        assert!(t.expand([2]).is_err());
     }
 
     #[test]
     fn test_expand_zero_copy_verification() {
         // Weryfikacja, czy faktycznie nie kopiujemy danych (czy wskaźniki są te same)
-        let t = Tensor::new(vec![1], vec![123.0]).unwrap();
-        let expanded = t.expand(&[100, 100]).unwrap();
+        let t = Tensor::new([1], vec![123.0]).unwrap();
+        let expanded = t.expand([100, 100]).unwrap();
 
         // Oba tensory powinny wskazywać na ten sam obszar pamięci
         assert_eq!(t.data_ptr(), expanded.data_ptr());

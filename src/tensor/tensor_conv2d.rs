@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use crate::error::LibError;
 use crate::tensor::tensor::Tensor;
 use crate::tensor::tensor::TensorFloat;
@@ -7,16 +9,13 @@ use rayon::prelude::*;
 
 // Abandon hope, all ye who enter here
 
-impl<T> TensorConv2D<Tensor<T>> for Tensor<T>
-where
-    T: TensorFloat,
-{
+impl<T: TensorFloat> TensorConv2D<T> for Tensor<T, 4> {
     fn conv2d(
         &self,
-        images: Tensor<T>,
+        images: Tensor<T, 4>,
         stride: (usize, usize),
         padding: (usize, usize),
-    ) -> Result<Tensor<T>, LibError> {
+    ) -> Result<Tensor<T, 4>, LibError> {
         // c - number of channels
         // w_in - width of input
         // h_in - height of input
@@ -65,10 +64,11 @@ where
         //    std::time::Instant::now().duration_since(flter_mat_time)
         //);
         let filter_mat = unsafe {
-            Tensor::new_raw(
-                vec![filter_c_out, filter_c_in * filter_h * filter_w],
-                filter_mat_data,
-                vec![(filter_c_in * filter_h * filter_w) as isize, 1],
+            Tensor::new_with_strides(
+                [filter_c_out, filter_c_in * filter_h * filter_w],
+                [(filter_c_in * filter_h * filter_w) as isize, 1],
+                Arc::new(filter_mat_data),
+                None,
             )
         };
         /*
@@ -150,7 +150,7 @@ where
             "Image Mat Time: {:?}",
             std::time::Instant::now().duration_since(image_mat_time)
         );
-        let image_shape = vec![image_c * filter_h * filter_w, h_out * w_out * image_n];
+        let image_shape = [image_c * filter_h * filter_w, h_out * w_out * image_n];
 
         #[cfg(debug_assertions)]
         println!("h_out: {}, w_out: {}", h_out, w_out);
@@ -171,7 +171,7 @@ where
         #[cfg(debug_assertions)]
         println!("Output Image Before Reshape: {}", output_image);
         let output_image = output_image
-            .reshape(vec![filter_c_out, w_out, h_out, image_n])
+            .reshape([filter_c_out, w_out, h_out, image_n])
             .unwrap();
         #[cfg(debug_assertions)]
         println!("Output Image Mat: {}", output_image);
@@ -184,12 +184,12 @@ where
     }
 
     fn im2col(
-        images: Tensor<T>,
+        images: Tensor<T, 4>,
         w_kernel: usize,
         h_kernel: usize,
         stride: (usize, usize),
         padding: (usize, usize),
-    ) -> Result<Tensor<T>, LibError> {
+    ) -> Result<Tensor<T, 2>, LibError> {
         let (c_image_in, w_image_in, h_image_in, n) = (
             images.shape()[0],
             images.shape()[1],
@@ -239,7 +239,7 @@ where
                 }
             });
 
-        let image_shape = vec![c_image_in * h_kernel * w_kernel, h_out * w_out * n];
+        let image_shape = [c_image_in * h_kernel * w_kernel, h_out * w_out * n];
         let x_col = Tensor::new(image_shape, image_mat_data)?;
 
         Ok(x_col)
@@ -255,7 +255,7 @@ where
     /// matrix of shape (C_out, C_in * H_kernel * W_kernel)
     /// ## error
     /// for now, we only broadcast errors
-    fn kn2k_mat(filters: Tensor<T>) -> Result<Tensor<T>, LibError> {
+    fn kn2k_mat(filters: Tensor<T, 4>) -> Result<Tensor<T, 2>, LibError> {
         let (c_in, w_kernel, h_kernel, c_out) = (
             filters.shape()[0],
             filters.shape()[1],
@@ -291,10 +291,11 @@ where
             })
             .collect();
         let k_mat = unsafe {
-            Tensor::new_raw(
-                vec![c_out, c_in * h_kernel * w_kernel],
-                filter_mat_data,
-                vec![(c_in * h_kernel * w_kernel) as isize, 1],
+            Tensor::new_with_strides(
+                [c_out, c_in * h_kernel * w_kernel],
+                [(c_in * h_kernel * w_kernel) as isize, 1],
+                Arc::new(filter_mat_data),
+                None,
             )
         };
         // */
@@ -306,13 +307,13 @@ where
     /// Input shape = [w_kernel * h_kernel * c_in, w_out * h_out * n]
     /// Output shape = [c, w, h, n]
     fn col2im(
-        x_col: Tensor<T>,
+        x_col: Tensor<T, 2>,
         image_shape: (usize, usize, usize, usize), // (C_in, W_in, H_in, N)
         w_kernel: usize,
         h_kernel: usize,
         stride: (usize, usize),
         padding: (usize, usize),
-    ) -> Result<Tensor<T>, LibError> {
+    ) -> Result<Tensor<T, 4>, LibError> {
         let (c, w, h, n) = image_shape;
         let (stride_h, stride_w) = stride;
         let (padding_h, padding_w) = padding;
@@ -374,7 +375,7 @@ where
                 }
             });
 
-        let result = Tensor::new(vec![c, w, h, n], image_grad_data)?;
+        let result = Tensor::new([c, w, h, n], image_grad_data)?;
         Ok(result)
     }
 }
@@ -390,7 +391,7 @@ pub mod tests {
     fn test_conv2d() {
         //let image = Tensor::from_fn(vec![5, 5, 1, 1], |_| 1.0).unwrap();
         let image = Tensor::new(
-            vec![1, 5, 5, 1],
+            [1, 5, 5, 1],
             vec![
                 0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0,
                 15.0, 16.0, 17.0, 18.0, 19.0, 20.0, 21.0, 22.0, 23.0, 24.0,
@@ -399,14 +400,14 @@ pub mod tests {
         .unwrap();
         println!("Image: {}", image);
         let kernel = Tensor::new_row(
-            vec![3, 3, 1, 1],
+            [3, 3, 1, 1],
             vec![0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0],
         )
         .unwrap();
         println!("Kernel: {}", kernel);
         let out = kernel.conv2d(image, (1, 1), (0, 0)).unwrap();
         let out_expected = Tensor::new(
-            vec![1, 3, 3, 1],
+            [1, 3, 3, 1],
             vec![7.0, 9.0, 11.0, 17.0, 19.0, 21.0, 27.0, 29.0, 31.0],
         )
         .unwrap();
@@ -419,7 +420,7 @@ pub mod tests {
     fn test_conv2d_single_image_2c_in() {
         // Obraz wejściowy o kształcie [C, W, H], czyli [1, 5, 5]
         let image = Tensor::new(
-            vec![2, 5, 5, 1],
+            [2, 5, 5, 1],
             vec![
                 0.0, 25.0, 1.0, 26.0, 2.0, 27.0, 3.0, 28.0, 4.0, 29.0, 5.0, 30.0, 6.0, 31.0, 7.0,
                 32.0, 8.0, 33.0, 9.0, 34.0, 10.0, 35.0, 11.0, 36.0, 12.0, 37.0, 13.0, 38.0, 14.0,
@@ -433,7 +434,7 @@ pub mod tests {
         // Jądro konwolucji (filtr)
         // /*
         let kernel = Tensor::new_row(
-            vec![3, 3, 2, 2], // [H_f, W_f, C_in, C_out]
+            [3, 3, 2, 2], // [H_f, W_f, C_in, C_out]
             vec![
                 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0,
                 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0,
@@ -449,7 +450,7 @@ pub mod tests {
         println!("Output: {}", out);
         // Oczekiwany wynik
         let out_expected = Tensor::new(
-            vec![2, 3, 3, 1], // [C_out, W_out, H_out]
+            [2, 3, 3, 1], // [C_out, W_out, H_out]
             vec![
                 34.0, 31.0, 37.0, 32.0, 40.0, 33.0, 49.0, 36.0, 52.0, 37.0, 55.0, 38.0, 64.0, 41.0,
                 67.0, 42.0, 70.0, 43.0,
@@ -464,7 +465,7 @@ pub mod tests {
     #[test]
     fn test_conv2d_padding() {
         let image = Tensor::new(
-            vec![1, 5, 5, 1],
+            [1, 5, 5, 1],
             vec![
                 0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0,
                 15.0, 16.0, 17.0, 18.0, 19.0, 20.0, 21.0, 22.0, 23.0, 24.0,
@@ -475,7 +476,7 @@ pub mod tests {
 
         // Jądro konwolucji (filtr)
         let kernel = Tensor::new_row(
-            vec![3, 3, 1, 1], // [H_f, W_f, C_in, C_out]
+            [3, 3, 1, 1], // [H_f, W_f, C_in, C_out]
             vec![0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0],
         )
         .unwrap();
@@ -488,7 +489,7 @@ pub mod tests {
         println!("Output data: {:?}", out.get_data());
         // Oczekiwany wynik
         let out_expected = Tensor::new(
-            vec![1, 5, 5, 1], // [C_out, W_out, H_out]
+            [1, 5, 5, 1], // [C_out, W_out, H_out]
             vec![
                 0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 7.0, 9.0, 11.0, 13.0, 15.0, 17.0, 19.0, 21.0, 23.0,
                 25.0, 27.0, 29.0, 31.0, 33.0, 35.0, 37.0, 39.0, 41.0, 43.0,
@@ -503,7 +504,7 @@ pub mod tests {
     #[test]
     fn test_conv2d_padding_strides() {
         let image = Tensor::new(
-            vec![1, 5, 5, 1],
+            [1, 5, 5, 1],
             vec![
                 0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0,
                 15.0, 16.0, 17.0, 18.0, 19.0, 20.0, 21.0, 22.0, 23.0, 24.0,
@@ -514,7 +515,7 @@ pub mod tests {
 
         // Jądro konwolucji (filtr)
         let kernel = Tensor::new_row(
-            vec![3, 3, 1, 1], // [H_f, W_f, C_in, C_out]
+            [3, 3, 1, 1], // [H_f, W_f, C_in, C_out]
             vec![0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0],
         )
         .unwrap();
@@ -527,7 +528,7 @@ pub mod tests {
         println!("Output data: {:?}", out.get_data());
         // Oczekiwany wynik
         let out_expected = Tensor::new(
-            vec![1, 3, 3, 1], // [C_out, W_out, H_out]
+            [1, 3, 3, 1], // [C_out, W_out, H_out]
             vec![0.0, 2.0, 4.0, 15.0, 19.0, 23.0, 35.0, 39.0, 43.0],
         )
         .unwrap();
@@ -539,7 +540,7 @@ pub mod tests {
     #[test]
     fn test_conv2d_padding_uneven_strides() {
         let image = Tensor::new(
-            vec![1, 5, 5, 1],
+            [1, 5, 5, 1],
             vec![
                 0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0,
                 15.0, 16.0, 17.0, 18.0, 19.0, 20.0, 21.0, 22.0, 23.0, 24.0,
@@ -550,7 +551,7 @@ pub mod tests {
 
         // Jądro konwolucji (filtr)
         let kernel = Tensor::new_row(
-            vec![3, 3, 1, 1], // [H_f, W_f, C_in, C_out]
+            [3, 3, 1, 1], // [H_f, W_f, C_in, C_out]
             vec![0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0],
         )
         .unwrap();
@@ -563,7 +564,7 @@ pub mod tests {
         println!("Output data: {:?}", out.get_data());
         // Oczekiwany wynik
         let out_expected = Tensor::new(
-            vec![1, 3, 5, 1], // [C_out, W_out, H_out]
+            [1, 3, 5, 1], // [C_out, W_out, H_out]
             vec![
                 0.0, 2.0, 4.0, 5.0, 9.0, 13.0, 15.0, 19.0, 23.0, 25.0, 29.0, 33.0, 35.0, 39.0, 43.0,
             ],
@@ -577,28 +578,28 @@ pub mod tests {
     #[ignore = "For now, batch isn't supported"]
     #[test]
     fn test_conv2d_big_1() {
-        let image: Tensor<f64> = Tensor::random([3, 1024, 1024, 5]);
-        let kernel: Tensor<f64> = Tensor::random([5, 5, 3, 16]);
+        let image: Tensor<f64, 4> = Tensor::random([3, 1024, 1024, 5]);
+        let kernel: Tensor<f64, 4> = Tensor::random([5, 5, 3, 16]);
         let time_start = std::time::Instant::now();
         let out = kernel.conv2d(image, (1, 1), (0, 0)).unwrap();
         println!(
             "Conv2D big 1 Time: {:?}",
             std::time::Instant::now().duration_since(time_start)
         );
-        assert_eq!(out.shape(), vec![16, 1020, 1020, 5]);
+        assert_eq!(*out.shape(), [16, 1020, 1020, 5]);
     }
 
     #[ignore = "For now, batch isn't supported"]
     #[test]
     fn test_conv2d_big_2() {
-        let image: Tensor<f64> = Tensor::random([3, 1024, 1024, 5]);
-        let kernel: Tensor<f64> = Tensor::random([7, 7, 3, 16]);
+        let image: Tensor<f64, 4> = Tensor::random([3, 1024, 1024, 5]);
+        let kernel: Tensor<f64, 4> = Tensor::random([7, 7, 3, 16]);
         let time_start = std::time::Instant::now();
         let out = kernel.conv2d(image, (1, 1), (0, 0)).unwrap();
         println!(
             "Conv2D big 2 Time: {:?}",
             std::time::Instant::now().duration_since(time_start)
         );
-        assert_eq!(out.shape(), vec![16, 1018, 1018, 5]);
+        assert_eq!(*out.shape(), [16, 1018, 1018, 5]);
     }
 }

@@ -68,7 +68,7 @@ impl<'a, T: TensorFloat> TensorRef<'a, T> {
         }
     }
 
-    pub fn matmul(&self, b: TensorRef<'a, T>) -> Result<Tensor<T>, String> {
+    pub fn matmul(&self, b: TensorRef<'a, T>) -> Result<Tensor<T, 2>, String> {
         //let b = b.as_ref();
 
         if self.shape.len() != 2 || b.shape.len() != 2 {
@@ -78,7 +78,7 @@ impl<'a, T: TensorFloat> TensorRef<'a, T> {
             return Err("Tensors have to be the same size!".to_string());
         }
 
-        let mut c: Tensor<T> = Tensor::zeros(&[self.shape()[0], b.shape()[1]]).unwrap();
+        let mut c: Tensor<T, 2> = Tensor::zeros([self.shape()[0], b.shape()[1]]).unwrap();
         println!("{c:?}");
         let c_faer = c.as_faer_mut_unsafe().unwrap();
         let a_faer = self.as_faer_ref_unsafe().unwrap();
@@ -143,10 +143,21 @@ impl<'a, T: TensorFloat> TensorRef<'a, T> {
         iter(&self)
     }
 
-    pub fn to_owned(&self) -> Tensor<T> {
-        let data = self.iter().collect::<Vec<T>>();
+    pub fn to_owned<const D: usize>(&self) -> Result<Tensor<T, D>, LibError> {
+        if self.shape.len() != D {
+            return Err(LibError::InvalidDimensionality {
+                operation: "TensorRef::to_owned".to_string(),
+                expected: D,
+                actual: self.shape.len(),
+            });
+        }
 
-        Tensor::new(self.shape.clone(), data).unwrap()
+        let data: Vec<T> = self.iter().collect();
+
+        let mut shape_arr = [0usize; D];
+        shape_arr.copy_from_slice(&self.shape);
+
+        Tensor::new(shape_arr, data)
     }
 
     /*
@@ -207,19 +218,17 @@ pub mod tests {
     #[test]
     pub fn matmul_reversed() {
         let tensor_a =
-            crate::tensor::tensor::Tensor::new_row(vec![2, 3], vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+            crate::tensor::tensor::Tensor::new_row([2, 3], vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
                 .unwrap();
-        let tensor_b = crate::tensor::tensor::Tensor::new_row(
-            vec![3, 2],
-            vec![7.0, 8.0, 9.0, 10.0, 11.0, 12.0],
-        )
-        .unwrap();
+        let tensor_b =
+            crate::tensor::tensor::Tensor::new_row([3, 2], vec![7.0, 8.0, 9.0, 10.0, 11.0, 12.0])
+                .unwrap();
 
         let tensor_b_ref = tensor_b.as_ref().rotate_180();
 
         let a_faer = tensor_a.as_faer_ref_unsafe().unwrap();
         let b_faer = tensor_b_ref.as_faer_ref_unsafe().unwrap();
-        let mut tensor_c = crate::tensor::tensor::Tensor::zeros(&[2, 2]).unwrap();
+        let mut tensor_c = crate::tensor::tensor::Tensor::zeros([2, 2]).unwrap();
         let mut c_faer = tensor_c.as_faer_mut_unsafe().unwrap();
         faer::linalg::matmul::matmul(
             &mut c_faer,
@@ -234,13 +243,13 @@ pub mod tests {
     #[test]
     fn test_to_tensor_from_contiguous_ref() {
         // 1. Stwórz oryginalny, posiadający dane Tensor
-        let original_tensor = Tensor::new(vec![2, 2], vec![1.0, 2.0, 3.0, 4.0]).unwrap();
+        let original_tensor = Tensor::new([2, 2], vec![1.0, 2.0, 3.0, 4.0]).unwrap();
 
         // 2. Stwórz z niego prosty TensorRef (widok)
         let tensor_ref = original_tensor.as_ref();
 
         // 3. Użyj testowanej metody, aby stworzyć nowy, posiadający dane Tensor
-        let new_tensor = tensor_ref.to_owned();
+        let new_tensor = tensor_ref.to_owned().unwrap();
 
         // 4. Sprawdź, czy nowy Tensor jest identyczny z oryginałem
         assert_eq!(new_tensor.shape(), original_tensor.shape());
@@ -252,7 +261,7 @@ pub mod tests {
     #[test]
     fn test_to_tensor_from_non_contiguous_ref() {
         // 1. Stwórz oryginalny Tensor
-        let original_tensor = Tensor::new(vec![2, 2], vec![1.0, 2.0, 3.0, 4.0]).unwrap();
+        let original_tensor = Tensor::new([2, 2], vec![1.0, 2.0, 3.0, 4.0]).unwrap();
         println!("Original Tensor: {:?}", original_tensor);
 
         // 2. Stwórz widok nieciągły (transponowany)
@@ -263,7 +272,7 @@ pub mod tests {
         println!("TensorRef: {:?}", tensor_ref);
 
         // 3. Użyj testowanej metody
-        let new_tensor = tensor_ref.to_owned();
+        let new_tensor = tensor_ref.to_owned().unwrap();
         println!("New Tensor from TensorRef: {:?}", new_tensor);
 
         // 4. Sprawdź, czy nowy Tensor ma poprawny (transponowany) kształt

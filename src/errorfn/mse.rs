@@ -11,12 +11,12 @@ impl Mse {
     }
 }
 
-impl<T: TensorFloat + std::iter::Sum> crate::errorfn::ErrorFn<T> for Mse {
+impl<T: TensorFloat + std::iter::Sum, const D: usize> crate::errorfn::ErrorFn<T, D> for Mse {
     fn compute(
         &self,
-        y_pred: &Tensor<T>,
-        y_true: &Tensor<T>,
-    ) -> Result<(T, Tensor<T>), crate::error::LibError> {
+        y_pred: &Tensor<T, D>,
+        y_true: &Tensor<T, D>,
+    ) -> Result<(T, Tensor<T, D>), crate::error::LibError> {
         let diff = y_pred.tensoradd(&y_true.map(|y| -*y))?;
         let n = T::from(y_pred.shape()[0]).unwrap(); // Liczba próbek
 

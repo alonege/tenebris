@@ -1,6 +1,6 @@
 use crate::{
     error::LibError,
-    layer::Module,
+    layer::Layer,
     tensor::{
         tensor::{Tensor, TensorFloat},
         tensorops::MatMul,
@@ -17,12 +17,11 @@ impl<T: TensorFloat> Softmax<T> {
     }
 }
 
-impl<T> Module<T> for Softmax<T>
+impl<T> Layer<Tensor<T, 2>> for Softmax<T>
 where
     T: TensorFloat,
 {
-    type Input<A> = Tensor<T>;
-    type Output<B> = Tensor<T>;
+    type Output = Tensor<T, 2>;
     fn forward(
         &mut self,
         input: Self::Input<T>,

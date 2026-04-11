@@ -2,7 +2,7 @@ use rand::distr::Distribution;
 use rand::rng;
 use rand_distr::Normal as NormalDist;
 
-use crate::{error::LibError, initialization::Initialization, tensor::tensor::TensorFloat};
+use crate::{error::LibError, initialization::InitializationRawData, tensor::tensor::TensorFloat};
 
 /// Normal (Gaussian) distribution initialization with custom parameters
 #[derive(Clone, Copy, Debug)]
@@ -21,7 +21,7 @@ impl Normal {
     }
 }
 
-impl<T: TensorFloat> Initialization<T> for Normal {
+impl<T: TensorFloat> InitializationRawData<T> for Normal {
     fn initialize_data(
         &self,
         _fan_in: usize,

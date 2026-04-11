@@ -1,32 +1,30 @@
 use crate::error::LibError;
-use crate::layer::Module;
+use crate::layer::Layer;
 use crate::tensor::tensor::{Tensor, TensorFloat};
 use crate::tensor::tensorops::MatMul;
 use crate::tensor::tensorops::TensorAdd;
 
 #[derive(Debug)]
-pub struct Linear<T: TensorFloat> {
-    weights: Tensor<T>,
-    bias: Tensor<T>,
+pub enum LinearCache<T: TensorFloat> {
+    Empty,
+    D1(Tensor<T, 1>),
+    D2(Tensor<T, 2>),
+}
 
-    cache_input: Option<Tensor<T>>,
+#[derive(Debug)]
+pub struct Linear<T: TensorFloat> {
+    weights: Tensor<T, 2>,
+    bias: Tensor<T, 2>,
+
+    cache_input: LinearCache<T>,
 }
 
 impl<T: TensorFloat> Linear<T> {
     pub fn new(
-        weights: Tensor<T>,
-        bias: Tensor<T>,
-        cache_input: Option<Tensor<T>>,
+        weights: Tensor<T, 2>,
+        bias: Tensor<T, 2>,
+        cache_input: LinearCache<T>,
     ) -> Result<Self, LibError> {
-        if weights.shape().len() != 2 || bias.shape().len() != 2 {
-            return Err(LibError::InvalidDimensionalityTwoTensors {
-                operation: "Linear::new()".to_string(),
-                expected_a: 2,
-                actual_a: weights.shape().len(),
-                expected_b: 2,
-                actual_b: bias.shape().len(),
-            });
-        }
         if weights.shape()[0] != bias.shape()[0] {
             return Err(LibError::InvalidDimensionality {
                 operation: "Layer::new() weights.shape()[0] != bias.shape()[0]".to_string(),
@@ -46,14 +44,14 @@ impl<T: TensorFloat> Linear<T> {
         //let mut random_cl = |_| rng.random();
         //let weights = Tensor::from_fn(vec![out_size, in_size], &mut random_cl).unwrap();
         //let bias = Tensor::from_fn(vec![out_size, 1], &mut random_cl).unwrap();
-        let weights = Tensor::random(&[out_size, in_size]);
-        let bias = Tensor::random(&[out_size, 1]);
+        let weights = Tensor::random([out_size, in_size]);
+        let bias = Tensor::random([out_size, 1]);
         //let weights = Tensor::new(&[out_size, in_size], );
 
         Self {
             weights,
             bias,
-            cache_input: None,
+            cache_input: LinearCache::Empty,
         }
     }
 
@@ -63,13 +61,13 @@ impl<T: TensorFloat> Linear<T> {
         //let weights = Matrix::new((out_size, in_size), &mut random_cl);
         //let bias = Matrix::new((out_size, 1), &mut random_cl);
 
-        let weights = Tensor::new_from_val(&[out_size, in_size], val).unwrap();
-        let bias = Tensor::new_from_val(&[out_size, 1], val).unwrap();
+        let weights = Tensor::new_from_val([out_size, in_size], val).unwrap();
+        let bias = Tensor::new_from_val([out_size, 1], val).unwrap();
 
         Self {
             weights,
             bias,
-            cache_input: None,
+            cache_input: LinearCache::Empty,
         }
     }
 
@@ -79,32 +77,44 @@ impl<T: TensorFloat> Linear<T> {
         init: &impl crate::initialization::Initialization<T>,
     ) -> Result<Self, LibError> {
         let weights = init
-            .initialize_tensor(in_size, out_size, vec![out_size, in_size])
+            .initialize_tensor(in_size, out_size, [out_size, in_size])
             .unwrap();
 
-        let bias = Tensor::zeros(vec![out_size, 1])?;
+        let bias = Tensor::zeros([out_size, 1])?;
         //let bias = init.initialize_tensor(out_size, out_size, vec![out_size, 1])?;
 
         Ok(Self {
             weights,
             bias,
-            cache_input: None,
+            cache_input: LinearCache::Empty,
         })
     }
 }
 
-impl<T: TensorFloat> Module<T> for Linear<T> {
-    type Input<A> = Tensor<T>;
-    type Output<B> = Tensor<T>;
+impl<T: TensorFloat> Linear<T> {
+    fn visit_params_internal<O: crate::optimizer::Optimizer>(&mut self, optimizer: &mut O) {
+        optimizer.update_tensor(&mut self.weights);
+        optimizer.update_tensor(&mut self.bias);
+    }
+
+    #[inline(always)]
+    fn clear_grad_internal(&mut self) {
+        self.weights.grad = None;
+        self.bias.grad = None;
+    }
+}
+
+impl<T: TensorFloat> Layer<Tensor<T, 2>> for Linear<T> {
+    type Output = Tensor<T, 2>;
 
     #[inline(always)]
     fn forward(
         &mut self,
-        input: Self::Input<T>,
+        input: Tensor<T, 2>,
         for_backward: bool,
-    ) -> Result<Self::Output<T>, LibError> {
+    ) -> Result<Self::Output, LibError> {
         if for_backward {
-            self.cache_input = Some(input.clone());
+            self.cache_input = LinearCache::D2(input.clone());
         }
         if input.shape().len() == 2 {
             // We have single Matrix as input
@@ -121,8 +131,13 @@ impl<T: TensorFloat> Module<T> for Linear<T> {
     }
 
     #[inline(always)]
-    fn backward(&mut self, grad_output: Self::Input<T>) -> Result<Self::Output<T>, LibError> {
-        let input = self.cache_input.as_ref().unwrap();
+    fn backward(&mut self, grad_output: Self::Output) -> Result<Tensor<T, 2>, LibError> {
+        let cached = std::mem::replace(&mut self.cache_input, LinearCache::Empty);
+
+        let input = match cached {
+            LinearCache::D2(tensor) => tensor,
+            _ => return Err(LibError::LayerErrorBackwardNoGradient),
+        };
 
         //println!("{grad_output}");
         //println!("{}", input.t());
@@ -133,7 +148,7 @@ impl<T: TensorFloat> Module<T> for Linear<T> {
             self.weights.grad = Some(Box::new(weights_grad));
         }
 
-        let bias_grad = grad_output.sum(1);
+        let bias_grad = grad_output.sum_keepdim(1);
         if let Some(existing_bias_grad) = self.bias.grad.take() {
             self.bias.grad = Some(Box::new(existing_bias_grad.tensoradd(&bias_grad)?));
         } else {
@@ -144,22 +159,80 @@ impl<T: TensorFloat> Module<T> for Linear<T> {
         Ok(downstream_grad)
     }
 
-    #[inline(always)]
-    fn parameters(&self) -> Vec<Tensor<T>> {
-        vec![self.weights.clone(), self.bias.clone()]
+    fn visit_params<O: crate::optimizer::Optimizer>(&mut self, optimizer: &mut O) {
+        self.visit_params_internal(optimizer);
     }
 
-    #[inline(always)]
-    fn parameters_mut(&mut self) -> Vec<&mut Tensor<T>> {
-        vec![&mut self.weights, &mut self.bias]
-    }
-
-    #[inline(always)]
     fn clear_grad(&mut self) {
-        self.weights.grad = None;
-        self.bias.grad = None;
+        self.clear_grad_internal();
     }
 }
+
+macro_rules! impl_linear_layer {
+    ($dim:expr) => {
+        impl<T: TensorFloat> Layer<Tensor<T, $dim>> for Linear<T> {
+            type Output = Tensor<T, $dim>;
+
+            fn forward(
+                &mut self,
+                input: Tensor<T, $dim>,
+                save_grads: bool,
+            ) -> Result<Self::Output, LibError> {
+                // features will be on 0 dimension - so we can get `in_features`` from there
+                let in_features = *input.shape()[0];
+
+                // all other things are just `logical_batch``
+                let logical_batch: usize = input.shape.iter().skip(1).product();
+
+                // prepare for GEMM - [in_features, logical_batch]
+                let batched_view: Tensor<T, 2> = input.reshape([in_features, logical_batch])?;
+
+                // we have [W_out x W_in] * [in_features x logical_batch] + bias_broadcasted -> [out_features x logical_batch]
+                let batched_out =
+                    <Self as Layer<Tensor<T, 2>>>::forward(self, batched_view, save_grads)?;
+
+                // let's set dims back to [out features, ...logical_batch_dims]
+                let mut out_shape = input.shape.clone();
+                out_shape[0] = self.weights.shape[0]; // out_features
+
+                Ok(batched_out.reshape(out_shape)?)
+            }
+
+            fn backward(
+                &mut self,
+                grad_output: Tensor<T, $dim>,
+            ) -> Result<Tensor<T, $dim>, LibError> {
+                // Analogiczne spłaszczanie dla gradientu
+                let out_features = grad_output.shape[0];
+                let logical_batch: usize = grad_output.shape.iter().skip(1).product();
+
+                let batched_grad: Tensor<T, 2> =
+                    grad_output.reshape([out_features, logical_batch])?;
+
+                // Wsteczna propagacja dla macierzy 2D (Sama wyciągnie cache!)
+                let batched_downstream_grad =
+                    <Self as Layer<Tensor<T, 2>>>::backward(self, batched_grad)?;
+
+                // Odtworzenie pierwotnego kształtu wejścia
+                let mut in_shape = grad_output.shape.clone();
+                in_shape[0] = self.weights.shape[1]; // in_features
+
+                Ok(batched_downstream_grad.reshape(in_shape)?)
+            }
+
+            fn visit_params<O: crate::optimizer::Optimizer>(&mut self, optimizer: &mut O) {
+                self.visit_params_internal(optimizer);
+            }
+
+            #[inline(always)]
+            fn clear_grad(&mut self) {
+                self.clear_grad_internal();
+            }
+        }
+    };
+}
+
+//impl_linear_layer!(1);
 
 #[allow(unused_imports)]
 mod tests {
@@ -171,11 +244,11 @@ mod tests {
 
     #[test]
     fn test_linear_forward() {
-        use crate::layer::Module;
+        use crate::layer::Layer;
         let mut linear = Linear::<f32>::new_val(3, 2, 1.0);
         println!("Weights: {:?}", linear.weights);
         println!("Bias: {:?}", linear.bias);
-        let input = Tensor::new(vec![3, 1], vec![1.0, 2.0, 3.0]).unwrap();
+        let input = Tensor::new([3, 1], vec![1.0, 2.0, 3.0]).unwrap();
         println!("Input: {:?}", input);
         let output = linear.forward(input, false).unwrap();
         println!("Output: {:?}", output);
@@ -184,13 +257,13 @@ mod tests {
 
     #[test]
     fn backpropagation_notation_denominator_shapes() {
-        use crate::layer::Module;
+        use crate::layer::Layer;
         let mut linear = Linear::<f32>::new_val(3, 2, 1.0);
-        let input = Tensor::new(vec![3, 1], vec![1.0, 2.0, 3.0]).unwrap();
+        let input = Tensor::new([3, 1], vec![1.0, 2.0, 3.0]).unwrap();
         let output = linear.forward(input, true);
         println!("Output: {:?}", output);
 
-        let grad = Tensor::new(vec![2, 1], vec![0.1, 0.2]).unwrap();
+        let grad = Tensor::new([2, 1], vec![0.1, 0.2]).unwrap();
         let downstream_grad = linear.backward(grad).unwrap();
         println!("Downstream Grad: {:?}", downstream_grad);
 
@@ -206,21 +279,21 @@ mod tests {
     /// obliczonymi ręcznie na podstawie wzorów na pochodne.
     #[test]
     fn test_linear_backward_correctness() {
-        use crate::layer::Module;
+        use crate::layer::Layer;
         // === Krok 1: ARRANGE (Przygotowanie danych) ===
 
         // Tworzymy warstwę Linear 2 -> 3 z prostymi, znanymi wagami.
         // Używamy typu f32, ponieważ jest najczęstszy i łatwy w testowaniu.
         let mut linear = Linear::<f32>::new_val(3, 2, 0.0);
-        linear.weights = Tensor::new(vec![3, 2], vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
-        linear.bias = Tensor::new(vec![3, 1], vec![0.1, 0.2, 0.3]).unwrap();
+        linear.weights = Tensor::new([3, 2], vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
+        linear.bias = Tensor::new([3, 1], vec![0.1, 0.2, 0.3]).unwrap();
 
         // Tworzymy tensor wejściowy (kształt [2, 1] - jedna próbka, 2 cechy)
-        let input = Tensor::new(vec![2, 1], vec![10.0, 20.0]).unwrap();
+        let input = Tensor::new([2, 1], vec![10.0, 20.0]).unwrap();
 
         // Definiujemy gradient "płynący" z następnej warstwy (dL/dY).
         // Musi mieć taki sam kształt jak wyjście warstwy (dla Y=W*X+B, wyjście ma kształt [3, 1]).
-        let grad_output = Tensor::new(vec![3, 1], vec![0.1, 0.2, 0.3]).unwrap();
+        let grad_output = Tensor::new([3, 1], vec![0.1, 0.2, 0.3]).unwrap();
 
         // === Krok 2: ACT (Wykonanie testowanej logiki) ===
 
@@ -235,7 +308,7 @@ mod tests {
         // --- 3a. Sprawdzenie gradientu wag (dL/dW) ---
         // Wzór: dL/dW = dL/dY * X^T
         let expected_weights_grad =
-            Tensor::new(vec![3, 2], vec![1.0, 2.0, 3.0, 2.0, 4.0, 6.0]).unwrap();
+            Tensor::new([3, 2], vec![1.0, 2.0, 3.0, 2.0, 4.0, 6.0]).unwrap();
         match &linear.weights.grad {
             Some(wg) => {
                 println!("Weights grad: {:?}", wg);
@@ -259,7 +332,7 @@ mod tests {
         // --- 3c. Sprawdzenie gradientu wejścia (dL/dX) ---
         // Wzór: dL/dX = W^T * dL/dY
         let expected_downstream_grad = Tensor::new(
-            vec![2, 1],
+            [2, 1],
             vec![1.4, 3.2], // [1*0.1+3*0.2+5*0.3, 2*0.1+4*0.2+6*0.3]
         )
         .unwrap();
@@ -274,32 +347,33 @@ mod tests {
     #[test]
     fn test_module_linear_backward_correctness() {
         // === Krok 1: ARRANGE (Przygotowanie danych) ===
-        use crate::layer::Module;
+        use crate::layer::Layer;
 
         // Tworzymy warstwę Linear 2 -> 3.
         //let mut linear = Linear::<f32>::new_val(2, 3, 1.0);
-        let weights = Tensor::ones(vec![3, 2]).unwrap();
-        let bias = Tensor::zeros(vec![3, 0]).unwrap();
-        let mut linear = Linear::<f32>::new(weights, bias, None).unwrap();
+        let weights = Tensor::ones([3, 2]).unwrap();
+        let bias = Tensor::zeros([3, 1]).unwrap();
+        let mut linear =
+            Linear::<f32>::new(weights, bias, crate::layer::linear::LinearCache::Empty).unwrap();
 
         // Ustawiamy wagi. Dla kształtu [3, 2] w układzie column-major,
         // wektor `vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]` tworzy macierz:
         // W = [[1.0, 4.0],
         //      [2.0, 5.0],
         //      [3.0, 6.0]]
-        linear.weights = Tensor::new(vec![3, 2], vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
-        linear.bias = Tensor::new(vec![3, 1], vec![0.1, 0.2, 0.3]).unwrap();
+        linear.weights = Tensor::new([3, 2], vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
+        linear.bias = Tensor::new([3, 1], vec![0.1, 0.2, 0.3]).unwrap();
 
         // Wejście X (kształt [2, 1])
         // X = [[10.0],
         //      [20.0]]
-        let input = Tensor::new(vec![2, 1], vec![10.0, 20.0]).unwrap();
+        let input = Tensor::new([2, 1], vec![10.0, 20.0]).unwrap();
 
         // Gradient z góry, dL/dY (kształt [3, 1])
         // dL/dY = [[0.1],
         //          [0.2],
         //          [0.3]]
-        let grad_output = Tensor::new(vec![3, 1], vec![0.1, 0.2, 0.3]).unwrap();
+        let grad_output = Tensor::new([3, 1], vec![0.1, 0.2, 0.3]).unwrap();
 
         // === Krok 2: ACT (Wykonanie testowanej logiki) ===
 
@@ -321,7 +395,7 @@ mod tests {
         // Oczekiwana macierz dL/dW.
         // W formacie column-major, dane w wektorze to: [1.0, 2.0, 3.0, 2.0, 4.0, 6.0]
         let expected_weights_grad =
-            Tensor::new(vec![3, 2], vec![1.0, 2.0, 3.0, 2.0, 4.0, 6.0]).unwrap();
+            Tensor::new([3, 2], vec![1.0, 2.0, 3.0, 2.0, 4.0, 6.0]).unwrap();
         match &linear.weights.grad {
             Some(wg) => {
                 println!("Obliczony gradient wag: {:?}", wg.get_data());
@@ -353,7 +427,7 @@ mod tests {
         //  [4, 5, 6]]      [0.2],    [4*0.1 + 5*0.2 + 6*0.3]]    [0.4 + 1.0 + 1.8]]    [3.2]]
         // Oczekiwana macierz dL/dX.
         // W formacie column-major, dane w wektorze to: [1.4, 3.2]
-        let expected_downstream_grad = Tensor::new(vec![2, 1], vec![1.4, 3.2]).unwrap();
+        let expected_downstream_grad = Tensor::new([2, 1], vec![1.4, 3.2]).unwrap();
         println!(
             "Obliczony gradient wejścia: {:?}",
             downstream_grad.get_data()
@@ -372,22 +446,23 @@ mod tests {
 
     #[test]
     fn test_linear_forward_batch_broadcasting() {
-        use crate::layer::Module;
+        use crate::layer::Layer;
 
         // 1. Setup: Warstwa Linear (2 wejścia -> 3 wyjścia)
         // Wagi: [[1, 1], [2, 2], [3, 3]] (w układzie column-major)
-        let weights = Tensor::new(vec![3, 2], vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0]).unwrap();
+        let weights = Tensor::new([3, 2], vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0]).unwrap();
 
         // Bias: [[10], [20], [30]] - to będzie broadcastowane
-        let bias = Tensor::new(vec![3, 1], vec![10.0, 20.0, 30.0]).unwrap();
+        let bias = Tensor::new([3, 1], vec![10.0, 20.0, 30.0]).unwrap();
 
-        let mut linear = Linear::new(weights, bias, None).unwrap();
+        let mut linear =
+            Linear::new(weights, bias, crate::layer::linear::LinearCache::Empty).unwrap();
 
         // 2. Input: Batch wielkości 2
         // Próbka 1 (kolumna 0): [1, 0]
         // Próbka 2 (kolumna 1): [0, 1]
         // Kształt: [In, Batch] = [2, 2]
-        let input = Tensor::new(vec![2, 2], vec![1.0, 0.0, 0.0, 1.0]).unwrap();
+        let input = Tensor::new([2, 2], vec![1.0, 0.0, 0.0, 1.0]).unwrap();
 
         // 3. Forward
         // Oczekujemy, że wewnątrz zadziała: (Weights * Input) + Bias_Broadcasted

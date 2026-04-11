@@ -1,211 +1,180 @@
-use crate::layer::Module;
+//! Activation Layer Module.
+//!
+//! Applies highly-optimized, statically dispatched non-linear activation functions.
+
+use crate::error::LibError;
+use crate::layer::Layer;
 use crate::tensor::tensor::Tensor;
 use crate::tensor::tensor::TensorFloat;
 
-/// Activation Module struct.
+/// Mathematical definition of an activation function.
 ///
-/// It contains both activation function and its derivative.
-pub struct Activation<T: TensorFloat> {
-    fun: Box<dyn Fn(T) -> T + Send + Sync>,
-    derivative: Box<dyn Fn(T) -> T + Send + Sync>,
-    input_cache: Option<Tensor<T>>,
+/// This trait allows for fully static dispatch and aggressive LLVM inlining,
+/// enabling auto-vectorization (SIMD) across tensor elements.
+pub trait ActivationFn<T: TensorFloat>: Clone + Send + Sync {
+    /// Applies the activation function to a single element.
+    fn activate(&self, x: T) -> T;
+
+    /// Computes the derivative of the activation function for a single element.
+    fn derivative(&self, x: T) -> T;
 }
 
-impl<T: TensorFloat + 'static> Activation<T> {
-    /// function to create new activation Module with user-defined
-    /// function and its derivative.
-    ///
-    /// Example for creating Activation Module with square function:
-    /// ```
-    /// use libmlrs::layer::activation::Activation;
-    /// use libmlrs::tensor::tensor::Tensor;
-    /// use crate::libmlrs::layer::Module;
-    ///
-    /// let square = |x| x * x;
-    /// let square_deriv = |x| 2.0 * x;
-    ///
-    /// let mut square = Activation::new(square, square_deriv);
-    ///
-    /// let input = Tensor::new(vec![2, 2], vec![1.0, 2.0, 3.0, 4.0]).unwrap();
-    ///
-    /// let output = square.forward(input.clone(), false).unwrap();
-    /// assert_eq!(output.get_data(), &[1.0, 4.0, 9.0, 16.0]);
-    /// ```
-    pub fn new<F, D>(fun: F, derivative: D) -> Self
-    where
-        F: Fn(T) -> T + 'static + Send + Sync,
-        D: Fn(T) -> T + 'static + Send + Sync,
-    {
-        Self {
-            fun: Box::new(fun),
-            derivative: Box::new(derivative),
-            input_cache: None,
+/// Rectified Linear Unit (ReLU) activation function.
+#[derive(Debug, Clone, Default)]
+pub struct Relu;
+
+impl<T: TensorFloat> ActivationFn<T> for Relu {
+    #[inline(always)]
+    fn activate(&self, x: T) -> T {
+        if x >= T::zero() { x } else { T::zero() }
+    }
+
+    #[inline(always)]
+    fn derivative(&self, x: T) -> T {
+        if x >= T::zero() { T::one() } else { T::zero() }
+    }
+}
+
+/// Leaky ReLU activation function with a configurable alpha slope.
+#[derive(Debug, Clone)]
+pub struct LeakyRelu<T: TensorFloat> {
+    pub alpha: T,
+}
+
+impl<T: TensorFloat> ActivationFn<T> for LeakyRelu<T> {
+    #[inline(always)]
+    fn activate(&self, x: T) -> T {
+        if x >= T::zero() { x } else { self.alpha * x }
+    }
+
+    #[inline(always)]
+    fn derivative(&self, x: T) -> T {
+        if x >= T::zero() { T::one() } else { self.alpha }
+    }
+}
+
+/// Leaky ELU activation function with a configurable alpha slope.
+#[derive(Debug, Clone)]
+pub struct Elu<T: TensorFloat> {
+    pub alpha: T,
+}
+
+impl<T: TensorFloat> ActivationFn<T> for Elu<T> {
+    #[inline(always)]
+    fn activate(&self, x: T) -> T {
+        if x >= T::zero() {
+            x
+        } else {
+            self.alpha * (x.exp() - T::one())
         }
     }
 
-    pub fn relu() -> Self {
-        let fun = Box::new(move |x: T| if x >= T::zero() { x } else { T::zero() });
-        let derivative = Box::new(move |x: T| if x >= T::zero() { T::one() } else { T::zero() });
-        Self {
-            fun,
-            derivative,
-            input_cache: None,
-        }
-    }
-
-    pub fn lrelu(alpha: T) -> Self {
-        let fun = Box::new(move |x: T| if x >= T::zero() { x } else { alpha * x });
-        let derivative = Box::new(move |x: T| if x >= T::zero() { T::one() } else { alpha });
-        Self {
-            fun,
-            derivative,
-            input_cache: None,
-        }
-    }
-
-    pub fn elu(alpha: T) -> Self {
-        let fun = Box::new(move |x: T| {
-            if x >= T::zero() {
-                x
-            } else {
-                alpha * (x.exp() - T::one())
-            }
-        });
-        let derivative = Box::new(move |x: T| {
-            if x >= T::zero() {
-                T::one()
-            } else {
-                alpha * x.exp()
-            }
-        });
-
-        Self {
-            fun,
-            derivative,
-            input_cache: None,
-        }
-    }
-
-    pub fn sigmoid() -> Self {
-        let fun = Box::new(|x: T| T::one() / (T::one() + (-x).exp()));
-        let derivative = Box::new(|x: T| {
-            let s = T::one() / (T::one() + (-x).exp());
-            s * (T::one() - s)
-        });
-        Self {
-            fun,
-            derivative,
-            input_cache: None,
-        }
-    }
-
-    pub fn tanh() -> Self {
-        let fun = Box::new(|x: T| x.tanh());
-        let derivative = Box::new(|x: T| {
-            let t = x.tanh();
-            T::one() - t * t
-        });
-        Self {
-            fun,
-            derivative,
-            input_cache: None,
+    #[inline(always)]
+    fn derivative(&self, x: T) -> T {
+        if x >= T::zero() {
+            T::one()
+        } else {
+            self.alpha * x.exp()
         }
     }
 }
 
-impl<T: TensorFloat> Module<T> for Activation<T> {
-    type Input<A> = Tensor<T>;
-    type Output<B> = Tensor<T>;
+/// Sigmoid activation function.
+#[derive(Debug, Clone, Default)]
+pub struct Sigmoid;
 
-    fn forward(
-        &mut self,
-        input: Self::Input<T>,
-        save_grads: bool,
-    ) -> Result<Self::Output<T>, crate::error::LibError> {
-        if save_grads == true {
-            self.input_cache = Some(input.clone());
-        }
-        match input.is_unique() {
-            true => {
-                let mut input = input.make_unique();
-                input.map_inplace(|x| (self.fun)(x));
-                return Ok(input);
-            }
-            false => {
-                return Ok(input.map(|x| (self.fun)(*x)));
-            }
-        }
+impl<T: TensorFloat> ActivationFn<T> for Sigmoid {
+    #[inline(always)]
+    fn activate(&self, x: T) -> T {
+        T::one() / (T::one() + (-x).exp())
     }
 
-    fn backward(
-        &mut self,
-        grad_output: Self::Input<T>,
-    ) -> Result<Self::Output<T>, crate::error::LibError> {
-        let input = self.input_cache.take();
-        let input = match input {
-            Some(a) => a,
-            None => return Err(crate::error::LibError::LayerErrorBackwardNoGradient),
-        };
-        let input = match input.is_unique() {
-            true => {
-                let mut input = input.make_unique();
-                input.map_inplace(|x| (self.derivative)(x));
-                input
-            }
-            false => input.map(|x| (self.derivative)(*x)),
-        };
-        Ok(grad_output.mul_elem(&input))
+    #[inline(always)]
+    fn derivative(&self, x: T) -> T {
+        let s = self.activate(x); // Reuse activate logic!
+        s * (T::one() - s)
     }
-
-    fn parameters(&self) -> Vec<crate::tensor::tensor::Tensor<T>> {
-        vec![]
-    }
-
-    fn parameters_mut(&mut self) -> Vec<&mut crate::tensor::tensor::Tensor<T>> {
-        vec![]
-    }
-
-    fn clear_grad(&mut self) {}
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::layer::Module;
-    use crate::tensor::tensor::Tensor;
+/// Tanh activation function.
+#[derive(Debug, Clone, Default)]
+pub struct Tanh;
 
-    #[test]
-    fn test_activation_layer() {
-        // Define a simple square function and its derivative
-        let square = |x| x * x;
-        let square_deriv = |x| 2.0 * x;
+impl<T: TensorFloat> ActivationFn<T> for Tanh {
+    #[inline(always)]
+    fn activate(&self, x: T) -> T {
+        x.tanh()
+    }
 
-        // Create the activation layer
-        let mut activation_layer = Activation::new(square, square_deriv);
+    #[inline(always)]
+    fn derivative(&self, x: T) -> T {
+        let t = x.tanh();
+        T::one() - t * t
+    }
+}
 
-        // Create input tensor
-        let input = Tensor::new(vec![2, 2], vec![1.0, 2.0, 3.0, 4.0]).unwrap();
+/// The Universal Activation Layer.
+///
+/// It wraps any static `ActivationFn` and handles dimensionality-agnostic caching
+/// and Copy-On-Write logic for the forward and backward passes.
+#[derive(Debug, Clone)]
+pub struct Activation<T: TensorFloat, F: ActivationFn<T>> {
+    /// The statically dispatched mathematical function (e.g., Relu, Sigmoid)
+    func: F,
+    /// Flat 1D cache to support inputs of any dimensionality `D`
+    input_cache: Option<Tensor<T, 1>>,
+}
 
-        // Test forward pass
-        let output = activation_layer.forward(input.clone(), false).unwrap();
-        assert_eq!(output.get_data(), &[1.0, 4.0, 9.0, 16.0]);
+impl<T: TensorFloat, F: ActivationFn<T>> Activation<T, F> {
+    /// Creates a new activation layer with the specified function logic.
+    pub fn new(func: F) -> Self {
+        Self {
+            func,
+            input_cache: None,
+        }
+    }
+}
 
-        // Test backward pass
-        let _ = activation_layer.forward(input.clone(), true).unwrap();
-        let grad = Tensor::new(vec![2, 2], vec![0.1, 0.2, 0.3, 0.4]).unwrap();
-        let downstream_grad = activation_layer.backward(grad).unwrap();
+impl<T: TensorFloat, const D: usize, F: ActivationFn<T>> Layer<Tensor<T, D>> for Activation<T, F> {
+    type Output = Tensor<T, D>;
 
-        // Expected downstream grad is grad * derivative(input)
-        // derivative(input) = [2*1, 2*2, 2*3, 2*4] = [2, 4, 6, 8]
-        // downstream_grad = [0.1*2, 0.2*4, 0.3*6, 0.4*8] = [0.2, 0.8, 1.8, 3.2]
-        let expected_grad_data = vec![0.2, 0.8, 1.8, 3.2];
-        let downstream_grad_data = downstream_grad.get_data();
+    #[inline(always)]
+    fn forward(&mut self, input: Tensor<T, D>, save_grads: bool) -> Result<Self::Output, LibError> {
+        if save_grads {
+            let numel = input.shape().iter().product();
+            self.input_cache = Some(input.reshape([numel])?);
+        }
 
-        downstream_grad_data
-            .iter()
-            .zip(expected_grad_data.iter())
-            .for_each(|(val, expected)| {
-                assert!(((val - expected) as f64).abs() < 1e-6);
-            });
+        let mut output = input.make_unique();
+
+        // PERFORMANCE: THINK about paralell
+        output.map_inplace(|x| self.func.activate(x));
+
+        Ok(output)
+    }
+
+    #[inline(always)]
+    fn backward(&mut self, grad_output: Self::Output) -> Result<Tensor<T, D>, LibError> {
+        let cached_1d = self
+            .input_cache
+            .take()
+            .ok_or(LibError::LayerErrorBackwardNoGradient)?;
+
+        let cached_input: Tensor<T, D> = cached_1d.reshape(grad_output.shape().clone())?;
+
+        let mut derivative_tensor = cached_input.make_unique();
+
+        // Same here: fully inlined SIMD loop
+        derivative_tensor.map_inplace(|x| self.func.derivative(x));
+
+        Ok(grad_output.mul_elem(&derivative_tensor))
+    }
+
+    #[inline(always)]
+    fn visit_params<O: crate::optimizer::Optimizer>(&mut self, _optimizer: &mut O) {}
+
+    #[inline(always)]
+    fn clear_grad(&mut self) {
+        self.input_cache = None;
     }
 }

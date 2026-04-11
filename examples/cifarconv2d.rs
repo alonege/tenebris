@@ -352,7 +352,7 @@ fn load_cifar_batch<T: TensorFloat>(
 
     for i in 0..dataset_count {
         let start = i * 3073;
-        let mut label_tensor = Tensor::<T>::zeros(vec![10, 1]).unwrap();
+        let mut label_tensor = Tensor::<T>::zeros([10, 1]).unwrap();
         label_tensor[&[buffer[start] as usize, 0]] = T::one();
         labels.push(label_tensor);
         let image_raw_data = buffer[start + 1..start + 3073]
@@ -361,7 +361,7 @@ fn load_cifar_batch<T: TensorFloat>(
                 ((T::from(*x).unwrap() * T::from(2.0).unwrap()) / T::from(255).unwrap()) - T::one()
             })
             .collect();
-        let image_tensor = unsafe { Tensor::new_raw(vec![3, 1024], image_raw_data, vec![1024, 1]) };
+        let image_tensor = unsafe { Tensor::new_raw([3, 1024], image_raw_data, [1024, 1]) };
         let image_tensor = image_tensor
             .make_contiguous()
             .unwrap()
