@@ -43,5 +43,13 @@ tikv-jemallocator = "0.6.1"
 mimalloc = "0.1.48"
 
 [profile.release]
-lto = "thin"
+opt-level = 3
+lto = "fat"
 codegen-units = 1
+
+[features]
+profile-layers = []
+
+[profile.profiling]
+inherits = "release"
+debug = true

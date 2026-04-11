@@ -6,6 +6,7 @@
 
 use crate::error::LibError;
 use crate::layer::Module;
+use crate::profile_layer;
 use crate::tensor::tensor::Tensor;
 use crate::tensor::tensor::TensorFloat;
 use rand::Rng;
@@ -159,23 +160,25 @@ impl<T: TensorFloat> Module<T> for Dropout<T> {
         input: Self::Input<T>,
         save_grads: bool,
     ) -> Result<Self::Output<T>, LibError> {
-        // W trybie inferencji lub gdy p = 0, zwróć wejście bez zmian
-        if !self.training || self.p == T::zero() {
-            self.mask_cache = None;
-            return Ok(input);
-        }
+        profile_layer!(Self, "Forward", {
+            // W trybie inferencji lub gdy p = 0, zwróć wejście bez zmian
+            if !self.training || self.p == T::zero() {
+                self.mask_cache = None;
+                return Ok(input);
+            }
 
-        let mask = self.generate_mask(input.shape());
+            let mask = self.generate_mask(input.shape());
 
-        let output = input.mul_elem(&mask);
+            let output = input.mul_elem(&mask);
 
-        if save_grads {
-            self.mask_cache = Some(mask);
-        } else {
-            self.mask_cache = None;
-        }
+            if save_grads {
+                self.mask_cache = Some(mask);
+            } else {
+                self.mask_cache = None;
+            }
 
-        Ok(output)
+            Ok(output)
+        })
     }
 
     /// Propagacja wsteczna.
@@ -194,21 +197,23 @@ impl<T: TensorFloat> Module<T> for Dropout<T> {
     /// ```
     /// Gradient przepływa tylko przez nie-wyzerowane elementy, skalowany przez `scale`.
     fn backward(&mut self, upstream_grad: Self::Output<T>) -> Result<Self::Input<T>, LibError> {
-        if !self.training || self.p == T::zero() {
-            return Ok(upstream_grad);
-        }
+        profile_layer!(Self, "Backward", {
+            if !self.training || self.p == T::zero() {
+                return Ok(upstream_grad);
+            }
 
-        let mask = self.mask_cache.take().ok_or_else(|| {
-            LibError::OtherError(
-                "Dropout backward called without cached mask. \
+            let mask = self.mask_cache.take().ok_or_else(|| {
+                LibError::OtherError(
+                    "Dropout backward called without cached mask. \
                       Ensure forward() was called with save_grads=true"
-                    .to_string(),
-            )
-        })?;
+                        .to_string(),
+                )
+            })?;
 
-        let downstream_grad = upstream_grad.mul_elem(&mask);
+            let downstream_grad = upstream_grad.mul_elem(&mask);
 
-        Ok(downstream_grad)
+            Ok(downstream_grad)
+        })
     }
 
     #[inline(always)]

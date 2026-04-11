@@ -1,5 +1,6 @@
 use crate::error::LibError;
 use crate::layer::Module;
+use crate::profile_layer;
 use crate::tensor::tensor::{Tensor, TensorFloat};
 use crate::tensor::tensorops::MatMul;
 use crate::tensor::tensorops::TensorAdd;
@@ -103,45 +104,49 @@ impl<T: TensorFloat> Module<T> for Linear<T> {
         input: Self::Input<T>,
         for_backward: bool,
     ) -> Result<Self::Output<T>, LibError> {
-        if for_backward {
-            self.cache_input = Some(input.clone());
-        }
-        if input.shape().len() == 2 {
-            // We have single Matrix as input
-            let bias_broad = &self
-                .bias
-                .expand([self.weights.shape()[0], input.shape()[1]])?;
-            self.weights.matmul(&input).unwrap().tensoradd(&bias_broad)
-        } else {
-            return Err(LibError::ShapeError(format!(
-                "Input shape not supported for Linear layer: {:?}",
-                input.shape()
-            )));
-        }
+        profile_layer!(Self, "Forward", {
+            if for_backward {
+                self.cache_input = Some(input.clone());
+            }
+            if input.shape().len() == 2 {
+                // We have single Matrix as input
+                let bias_broad = &self
+                    .bias
+                    .expand([self.weights.shape()[0], input.shape()[1]])?;
+                self.weights.matmul(&input).unwrap().tensoradd(&bias_broad)
+            } else {
+                return Err(LibError::ShapeError(format!(
+                    "Input shape not supported for Linear layer: {:?}",
+                    input.shape()
+                )));
+            }
+        })
     }
 
     #[inline(always)]
     fn backward(&mut self, grad_output: Self::Input<T>) -> Result<Self::Output<T>, LibError> {
-        let input = self.cache_input.as_ref().unwrap();
+        profile_layer!(Self, "Backward", {
+            let input = self.cache_input.as_ref().unwrap();
 
-        //println!("{grad_output}");
-        //println!("{}", input.t());
-        let weights_grad = grad_output.matmul(&input.t())?;
-        if let Some(existing_weights_grad) = self.weights.grad.take() {
-            self.weights.grad = Some(Box::new(existing_weights_grad.tensoradd(&weights_grad)?));
-        } else {
-            self.weights.grad = Some(Box::new(weights_grad));
-        }
+            //println!("{grad_output}");
+            //println!("{}", input.t());
+            let weights_grad = grad_output.matmul(&input.t())?;
+            if let Some(existing_weights_grad) = self.weights.grad.take() {
+                self.weights.grad = Some(Box::new(existing_weights_grad.tensoradd(&weights_grad)?));
+            } else {
+                self.weights.grad = Some(Box::new(weights_grad));
+            }
 
-        let bias_grad = grad_output.sum(1);
-        if let Some(existing_bias_grad) = self.bias.grad.take() {
-            self.bias.grad = Some(Box::new(existing_bias_grad.tensoradd(&bias_grad)?));
-        } else {
-            self.bias.grad = Some(Box::new(bias_grad));
-        }
+            let bias_grad = grad_output.sum(1);
+            if let Some(existing_bias_grad) = self.bias.grad.take() {
+                self.bias.grad = Some(Box::new(existing_bias_grad.tensoradd(&bias_grad)?));
+            } else {
+                self.bias.grad = Some(Box::new(bias_grad));
+            }
 
-        let downstream_grad = self.weights.t().matmul(&grad_output)?;
-        Ok(downstream_grad)
+            let downstream_grad = self.weights.t().matmul(&grad_output)?;
+            Ok(downstream_grad)
+        })
     }
 
     #[inline(always)]

@@ -1,6 +1,7 @@
 use crate::{
     error::LibError,
     layer::Module,
+    profile_layer,
     tensor::{
         tensor::{Tensor, TensorFloat},
         tensorops::MatMul,
@@ -28,56 +29,60 @@ where
         input: Self::Input<T>,
         save_grads: bool,
     ) -> Result<Self::Output<T>, LibError> {
-        //y[i] = exp(x[i]) / Σⱼ exp(x[j])
-        //println!("Softmax input: {:?}", input);
-        if input.shape().len() != 2 {
-            return Err(LibError::InvalidDimensionality {
-                operation: "Softmax needs 2 dim tensor".to_string(),
-                expected: 2,
-                actual: input.shape().len(),
-            });
-        }
-        if input.shape()[1] != 1 {
-            return Err(LibError::InvalidDimensionality {
-                operation: "Softmax needs shape (N, 1)".to_string(),
-                expected: 1,
-                actual: input.shape()[1],
-            });
-        }
-        let max_val = input.iter().fold(T::neg_infinity(), T::max);
-        let mut input = input.make_unique();
-        input.map_inplace(|x| T::exp(x - max_val));
-        let mut input_exp = input;
-        let exp_sum: T = input_exp.iter().fold(T::zero(), |acc, x| acc + x);
-        input_exp.map_inplace(|x| x / exp_sum);
-        //println!("Softmax output: {:?}", input_exp);
-        if save_grads {
-            self.output = Some(input_exp.clone());
-        }
-        Ok(input_exp)
+        profile_layer!(Self, "Forward", {
+            //y[i] = exp(x[i]) / Σⱼ exp(x[j])
+            //println!("Softmax input: {:?}", input);
+            if input.shape().len() != 2 {
+                return Err(LibError::InvalidDimensionality {
+                    operation: "Softmax needs 2 dim tensor".to_string(),
+                    expected: 2,
+                    actual: input.shape().len(),
+                });
+            }
+            if input.shape()[1] != 1 {
+                return Err(LibError::InvalidDimensionality {
+                    operation: "Softmax needs shape (N, 1)".to_string(),
+                    expected: 1,
+                    actual: input.shape()[1],
+                });
+            }
+            let max_val = input.iter().fold(T::neg_infinity(), T::max);
+            let mut input = input.make_unique();
+            input.map_inplace(|x| T::exp(x - max_val));
+            let mut input_exp = input;
+            let exp_sum: T = input_exp.iter().fold(T::zero(), |acc, x| acc + x);
+            input_exp.map_inplace(|x| x / exp_sum);
+            //println!("Softmax output: {:?}", input_exp);
+            if save_grads {
+                self.output = Some(input_exp.clone());
+            }
+            Ok(input_exp)
+        })
     }
 
     fn backward(&mut self, grad_output: Self::Input<T>) -> Result<Self::Output<T>, LibError> {
-        let y = self.output.take();
-        let y = match y {
-            Some(y) => y,
-            None => {
-                return Err(LibError::LayerErrorBackwardNoGradient);
-            }
-        };
-        let dot = y.t().matmul(&grad_output)?;
-        let dot = dot.get(&[0, 0]).unwrap();
-        //println!("Softmax backward dot: {:?}", dot);
+        profile_layer!(Self, "Backward", {
+            let y = self.output.take();
+            let y = match y {
+                Some(y) => y,
+                None => {
+                    return Err(LibError::LayerErrorBackwardNoGradient);
+                }
+            };
+            let dot = y.t().matmul(&grad_output)?;
+            let dot = dot.get(&[0, 0]).unwrap();
+            //println!("Softmax backward dot: {:?}", dot);
 
-        let mut grad_output = grad_output.make_unique();
-        grad_output.map_inplace(|x| x - dot);
-        let grad_minus_dot = grad_output;
-        //println!("Softmax backward grad_minus_dot: {:?}", grad_minus_dot);
+            let mut grad_output = grad_output.make_unique();
+            grad_output.map_inplace(|x| x - dot);
+            let grad_minus_dot = grad_output;
+            //println!("Softmax backward grad_minus_dot: {:?}", grad_minus_dot);
 
-        let downstream_grad = y.mul_elem(&grad_minus_dot);
-        //println!("Softmax backward downstream_grad: {:?}", downstream_grad);
+            let downstream_grad = y.mul_elem(&grad_minus_dot);
+            //println!("Softmax backward downstream_grad: {:?}", downstream_grad);
 
-        Ok(downstream_grad)
+            Ok(downstream_grad)
+        })
     }
 
     fn parameters(&self) -> Vec<Tensor<T>> {

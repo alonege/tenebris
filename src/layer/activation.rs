@@ -1,4 +1,5 @@
 use crate::layer::Module;
+use crate::profile_layer;
 use crate::tensor::tensor::Tensor;
 use crate::tensor::tensor::TensorFloat;
 
@@ -122,39 +123,41 @@ impl<T: TensorFloat> Module<T> for Activation<T> {
         input: Self::Input<T>,
         save_grads: bool,
     ) -> Result<Self::Output<T>, crate::error::LibError> {
-        if save_grads == true {
-            self.input_cache = Some(input.clone());
-        }
-        match input.is_unique() {
-            true => {
-                let mut input = input.make_unique();
-                input.map_inplace(|x| (self.fun)(x));
-                return Ok(input);
+        profile_layer!(Self, "Forward", {
+            if save_grads == true {
+                self.input_cache = Some(input.clone());
             }
-            false => {
-                return Ok(input.map(|x| (self.fun)(*x)));
+            match input.is_unique() {
+                true => {
+                    let mut input = input.make_unique();
+                    input.map_inplace(|x| (self.fun)(x));
+                    Ok(input)
+                }
+                false => Ok(input.map(|x| (self.fun)(*x))),
             }
-        }
+        })
     }
 
     fn backward(
         &mut self,
         grad_output: Self::Input<T>,
     ) -> Result<Self::Output<T>, crate::error::LibError> {
-        let input = self.input_cache.take();
-        let input = match input {
-            Some(a) => a,
-            None => return Err(crate::error::LibError::LayerErrorBackwardNoGradient),
-        };
-        let input = match input.is_unique() {
-            true => {
-                let mut input = input.make_unique();
-                input.map_inplace(|x| (self.derivative)(x));
-                input
-            }
-            false => input.map(|x| (self.derivative)(*x)),
-        };
-        Ok(grad_output.mul_elem(&input))
+        profile_layer!(Self, "Backward", {
+            let input = self.input_cache.take();
+            let input = match input {
+                Some(a) => a,
+                None => return Err(crate::error::LibError::LayerErrorBackwardNoGradient),
+            };
+            let input = match input.is_unique() {
+                true => {
+                    let mut input = input.make_unique();
+                    input.map_inplace(|x| (self.derivative)(x));
+                    input
+                }
+                false => input.map(|x| (self.derivative)(*x)),
+            };
+            Ok(grad_output.mul_elem(&input))
+        })
     }
 
     fn parameters(&self) -> Vec<crate::tensor::tensor::Tensor<T>> {
