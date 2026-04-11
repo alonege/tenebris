@@ -1,7 +1,7 @@
 use rand::distr::{Distribution, Uniform as UniformDist};
 use rand::rng;
 
-use crate::initialization::InitializationRawData;
+use crate::initialization::Initialization;
 use crate::tensor::tensor::TensorFloat;
 
 #[derive(Clone, Copy)]
@@ -13,7 +13,7 @@ impl Uniform {
     }
 }
 
-impl<T: TensorFloat> InitializationRawData<T> for Uniform {
+impl<T: TensorFloat> Initialization<T> for Uniform {
     fn initialize_data(
         &self,
         _fan_in: usize,

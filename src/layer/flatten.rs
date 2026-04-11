@@ -1,6 +1,7 @@
 use crate::{
     error::LibError,
     layer::{Layer, Tensor, TensorFloat},
+    profile_layer,
 };
 use std::marker::PhantomData;
 
@@ -24,24 +25,28 @@ impl<T: TensorFloat, const D: usize> Layer<Tensor<T, D>> for Flatten<T> {
     type Output = Tensor<T, 2>;
 
     fn forward(&mut self, input: Tensor<T, D>, save_grads: bool) -> Result<Self::Output, LibError> {
-        if save_grads {
-            self.input_shape_cache = Some(input.shape().to_vec());
-        }
-        let n = *input.shape().last().unwrap_or(&1);
-        let features = input.shape().iter().product::<usize>() / n;
-        input.reshape([features, n])
+        profile_layer!(Self, "Forward", {
+            if save_grads {
+                self.input_shape_cache = Some(input.shape().to_vec());
+            }
+            let n = *input.shape().last().unwrap_or(&1);
+            let features = input.shape().iter().product::<usize>() / n;
+            input.reshape([features, n])
+        })
     }
 
     fn backward(&mut self, grad_output: Self::Output) -> Result<Tensor<T, D>, LibError> {
-        let original_shape_vec = self
-            .input_shape_cache
-            .as_ref()
-            .ok_or_else(|| LibError::LayerErrorBackwardNoGradient)?;
+        profile_layer!(Self, "Backward", {
+            let original_shape_vec = self
+                .input_shape_cache
+                .as_ref()
+                .ok_or_else(|| LibError::LayerErrorBackwardNoGradient)?;
 
-        let mut original_shape = [0usize; D];
-        original_shape.copy_from_slice(original_shape_vec);
+            let mut original_shape = [0usize; D];
+            original_shape.copy_from_slice(original_shape_vec);
 
-        grad_output.reshape(original_shape)
+            grad_output.reshape(original_shape)
+        })
     }
 
     fn visit_params<O: crate::optimizer::Optimizer>(&mut self, _optimizer: &mut O) {

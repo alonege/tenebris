@@ -2,6 +2,7 @@
 
 use crate::initialization::Initialization;
 use crate::optimizer::Optimizer;
+use crate::profile_layer;
 use crate::tensor::tensorops::{MatMul, TensorAdd};
 use crate::{
     error::LibError,
@@ -74,169 +75,174 @@ impl<T: TensorFloat + 'static> Layer<Tensor<T, 4>> for Conv2D<T> {
         input: Tensor<T, 4>,
         for_backward: bool,
     ) -> Result<Self::Output, LibError> {
-        // unpacking of dim data
-        let (c_image, w_image, h_image, n) = (
-            input.shape()[0],
-            input.shape()[1],
-            input.shape()[2],
-            input.shape()[3],
-        );
+        profile_layer!(Self, "Forward", {
+            // unpacking of dim data
+            let (c_image, w_image, h_image, n) = (
+                input.shape()[0],
+                input.shape()[1],
+                input.shape()[2],
+                input.shape()[3],
+            );
 
-        let (c_in, w_kernel, h_kernel, c_out) = (
-            self.weights.shape()[0],
-            self.weights.shape()[1],
-            self.weights.shape()[2],
-            self.weights.shape()[3],
-        );
+            let (c_in, w_kernel, h_kernel, c_out) = (
+                self.weights.shape()[0],
+                self.weights.shape()[1],
+                self.weights.shape()[2],
+                self.weights.shape()[3],
+            );
 
-        let (padding_h, padding_w) = self.padding;
-        let (stride_h, stride_w) = self.stride;
+            let (padding_h, padding_w) = self.padding;
+            let (stride_h, stride_w) = self.stride;
 
-        //check for dim mismatch
+            //check for dim mismatch
 
-        if c_image != c_in {
-            return Err(LibError::InvalidDimensionality {
-                operation: "conv2d module forward; bad image input c_in".to_string(),
-                expected: c_in,
-                actual: c_image,
-            });
-        }
+            if c_image != c_in {
+                return Err(LibError::InvalidDimensionality {
+                    operation: "conv2d module forward; bad image input c_in".to_string(),
+                    expected: c_in,
+                    actual: c_image,
+                });
+            }
 
-        // calculate output shape
+            // calculate output shape
 
-        let h_out = (h_image - h_kernel + 2 * padding_h) / stride_h + 1;
-        let w_out = (w_image - w_kernel + 2 * padding_w) / stride_w + 1;
+            let h_out = (h_image - h_kernel + 2 * padding_h) / stride_h + 1;
+            let w_out = (w_image - w_kernel + 2 * padding_w) / stride_w + 1;
 
-        // save input for backward pass
+            // save input for backward pass
 
-        if for_backward {
-            self.input_cache = Some(input.clone());
-        }
+            if for_backward {
+                self.input_cache = Some(input.clone());
+            }
 
-        // let's get x_col by using im2col
-        // x_col shape = [w_kernel * h_kernel * c_in, w_out * h_out * n]
-        let x_col = <Tensor<T, 4> as TensorConv2D<T>>::im2col(
-            input.clone(),
-            w_kernel,
-            h_kernel,
-            self.stride,
-            self.padding,
-        )?;
-        //println!("x_col: {}", x_col);
+            // let's get x_col by using im2col
+            // x_col shape = [w_kernel * h_kernel * c_in, w_out * h_out * n]
+            let x_col = <Tensor<T, 4> as TensorConv2D<T>>::im2col(
+                input.clone(),
+                w_kernel,
+                h_kernel,
+                self.stride,
+                self.padding,
+            )?;
+            //println!("x_col: {}", x_col);
 
-        // and let's get k_mat by using kn2k_mat
-        // k_mat shape = [c_out, w_kernel * h_kernel * c_in]
-        let k_mat = <Tensor<T, 4> as TensorConv2D<T>>::kn2k_mat(self.weights.clone())?;
+            // and let's get k_mat by using kn2k_mat
+            // k_mat shape = [c_out, w_kernel * h_kernel * c_in]
+            let k_mat = <Tensor<T, 4> as TensorConv2D<T>>::kn2k_mat(self.weights.clone())?;
 
-        // calculate output
-        // output shape = [c_out, w_kernel * h_kernel * c_in] * [w_kernel * h_kernel * c_in, w_out * h_out * n] =
-        // = [c_out, w_out * h_out * n]
-        let output = k_mat.matmul(&x_col)?;
+            // calculate output
+            // output shape = [c_out, w_kernel * h_kernel * c_in] * [w_kernel * h_kernel * c_in, w_out * h_out * n] =
+            // = [c_out, w_out * h_out * n]
+            let output = k_mat.matmul(&x_col)?;
 
-        //reshape output
+            //reshape output
 
-        let output = output.reshape([c_out, w_out, h_out, n])?;
+            let output = output.reshape([c_out, w_out, h_out, n])?;
 
-        Ok(output)
+            Ok(output)
+        })
     }
 
     fn backward(&mut self, y_out: Self::Output) -> Result<Tensor<T, 4>, LibError> {
-        if self.input_cache.is_none() {
-            return Err(LibError::LayerErrorBackwardNoGradient);
-        }
+        profile_layer!(Self, "Backward", {
+            if self.input_cache.is_none() {
+                return Err(LibError::LayerErrorBackwardNoGradient);
+            }
 
-        let (c_in, w_kernel, h_kernel, c_out_kernel) = (
-            self.weights.shape()[0],
-            self.weights.shape()[1],
-            self.weights.shape()[2],
-            self.weights.shape()[3],
-        );
+            let (c_in, w_kernel, h_kernel, c_out_kernel) = (
+                self.weights.shape()[0],
+                self.weights.shape()[1],
+                self.weights.shape()[2],
+                self.weights.shape()[3],
+            );
 
-        // shape of y_out is [c_out, w_out, h_out, n]
-        let (c_out, w_out, h_out, n) = (
-            y_out.shape()[0],
-            y_out.shape()[1],
-            y_out.shape()[2],
-            y_out.shape()[3],
-        );
+            // shape of y_out is [c_out, w_out, h_out, n]
+            let (c_out, w_out, h_out, n) = (
+                y_out.shape()[0],
+                y_out.shape()[1],
+                y_out.shape()[2],
+                y_out.shape()[3],
+            );
 
-        if c_out != c_out_kernel {
-            return Err(LibError::InvalidDimensionality {
-                operation: "conv2d module backward; bad y_out c dimension".to_string(),
-                expected: c_out_kernel,
-                actual: c_out,
-            });
-        }
+            if c_out != c_out_kernel {
+                return Err(LibError::InvalidDimensionality {
+                    operation: "conv2d module backward; bad y_out c dimension".to_string(),
+                    expected: c_out_kernel,
+                    actual: c_out,
+                });
+            }
 
-        //println!("y_out: {}", y_out);
-        let y_out_cont = y_out.make_contiguous()?;
-        //println!("y_out_cont: {}", y_out_cont);
-        let y_out_reshaped = y_out_cont.reshape([c_out, w_out * h_out * n])?;
-        //println!("y_out_reshaped: {}", y_out_reshaped);
-        // y_out reshaped to [c_out, w_out * h_out * n]
+            //println!("y_out: {}", y_out);
+            let y_out_cont = y_out.make_contiguous()?;
+            //println!("y_out_cont: {}", y_out_cont);
+            let y_out_reshaped = y_out_cont.reshape([c_out, w_out * h_out * n])?;
+            //println!("y_out_reshaped: {}", y_out_reshaped);
+            // y_out reshaped to [c_out, w_out * h_out * n]
 
-        // let's calculate dL/dk
-        let x_col = <Tensor<T, 4> as TensorConv2D<T>>::im2col(
-            self.input_cache.as_ref().unwrap().clone(),
-            self.weights.shape()[1],
-            self.weights.shape()[2],
-            self.stride,
-            self.padding,
-        )?; // shape of x_col: [w_kernel * h_kernel * c_in, w_out * h_out, n]
+            // let's calculate dL/dk
+            let x_col = <Tensor<T, 4> as TensorConv2D<T>>::im2col(
+                self.input_cache.as_ref().unwrap().clone(),
+                self.weights.shape()[1],
+                self.weights.shape()[2],
+                self.stride,
+                self.padding,
+            )?; // shape of x_col: [w_kernel * h_kernel * c_in, w_out * h_out, n]
 
-        let x_col_t = x_col.t();
-        // x_col_t shape: [w_out * h_out * n, w_kernel * h_kernel * c_in]
+            let x_col_t = x_col.t();
+            // x_col_t shape: [w_out * h_out * n, w_kernel * h_kernel * c_in]
 
-        let k_grad = y_out_reshaped.matmul(&x_col_t)?;
-        // k_grad shape: [c_out, w_out * h_out * n] * [w_out * h_out * n, w_kernel * h_kernel * c_in] =
-        // = [c_out, w_kernel * h_kernel * c_in]
-        //println!("k_grad: {}", k_grad);
+            let k_grad = y_out_reshaped.matmul(&x_col_t)?;
+            // k_grad shape: [c_out, w_out * h_out * n] * [w_out * h_out * n, w_kernel * h_kernel * c_in] =
+            // = [c_out, w_kernel * h_kernel * c_in]
+            //println!("k_grad: {}", k_grad);
 
-        let k_grad_reshaped = k_grad
-            .reshape([c_out, w_kernel, h_kernel, c_in])?
-            .permute([3, 1, 2, 0]);
-        //println!("k_grad_reshaped: {}", k_grad_reshaped);
-        // k_grad_reshaped reshaped to [c_out, w_kernel, h_kernel, c_in]
-        // k_grad_reshaped then permuted to [c_in, w_kernel, h_kernel, c_out]
-        if let Some(existing_weights_grad) = self.weights.grad.take() {
-            self.weights.grad = Some(Box::new(existing_weights_grad.tensoradd(&k_grad_reshaped)?));
-        } else {
-            self.weights.grad = Some(Box::new(k_grad_reshaped));
-        }
+            let k_grad_reshaped = k_grad
+                .reshape([c_out, w_kernel, h_kernel, c_in])?
+                .permute([3, 1, 2, 0]);
+            //println!("k_grad_reshaped: {}", k_grad_reshaped);
+            // k_grad_reshaped reshaped to [c_out, w_kernel, h_kernel, c_in]
+            // k_grad_reshaped then permuted to [c_in, w_kernel, h_kernel, c_out]
+            if let Some(existing_weights_grad) = self.weights.grad.take() {
+                self.weights.grad =
+                    Some(Box::new(existing_weights_grad.tensoradd(&k_grad_reshaped)?));
+            } else {
+                self.weights.grad = Some(Box::new(k_grad_reshaped));
+            }
 
-        // dL/dX = K_mat^T * dL/dY
-        let k_mat = <Tensor<T, 4> as TensorConv2D<T>>::kn2k_mat(self.weights.clone())?;
-        // k_mat shape: [c_out, w_kernel * h_kernel * c_in]
+            // dL/dX = K_mat^T * dL/dY
+            let k_mat = <Tensor<T, 4> as TensorConv2D<T>>::kn2k_mat(self.weights.clone())?;
+            // k_mat shape: [c_out, w_kernel * h_kernel * c_in]
 
-        let k_mat_t = k_mat.t();
-        // k_mat_t shape: [w_kernel * h_kernel * c_in, c_out]
+            let k_mat_t = k_mat.t();
+            // k_mat_t shape: [w_kernel * h_kernel * c_in, c_out]
 
-        //println!("k_mat shape: {:?}", k_mat.shape());
-        //println!("y_out shape: {:?}", y_out.shape());
+            //println!("k_mat shape: {:?}", k_mat.shape());
+            //println!("y_out shape: {:?}", y_out.shape());
 
-        // grad_x_col = k_mat^T * y_out_reshaped
-        let grad_x_col = k_mat_t.matmul(&y_out_reshaped)?;
-        // grad_x_col shape: [w_kernel * h_kernel * c_in, c_out] * [c_out, w_out * h_out * n] =
-        // = [w_kernel * h_kernel * c_in, w_out * h_out * n]
-        //println!("grad_x_col {}", grad_x_col);
+            // grad_x_col = k_mat^T * y_out_reshaped
+            let grad_x_col = k_mat_t.matmul(&y_out_reshaped)?;
+            // grad_x_col shape: [w_kernel * h_kernel * c_in, c_out] * [c_out, w_out * h_out * n] =
+            // = [w_kernel * h_kernel * c_in, w_out * h_out * n]
+            //println!("grad_x_col {}", grad_x_col);
 
-        // grad_x = col2im(grad_x_col)
-        // grad_x shape = [c, w, h, n]
-        let grad_x = <Tensor<T, 4> as TensorConv2D<T>>::col2im(
-            grad_x_col.clone(),
-            (
-                self.input_cache.as_ref().unwrap().shape()[0],
-                self.input_cache.as_ref().unwrap().shape()[1],
-                self.input_cache.as_ref().unwrap().shape()[2],
-                self.input_cache.as_ref().unwrap().shape()[3],
-            ),
-            w_kernel,
-            h_kernel,
-            self.stride,
-            self.padding,
-        )?;
+            // grad_x = col2im(grad_x_col)
+            // grad_x shape = [c, w, h, n]
+            let grad_x = <Tensor<T, 4> as TensorConv2D<T>>::col2im(
+                grad_x_col.clone(),
+                (
+                    self.input_cache.as_ref().unwrap().shape()[0],
+                    self.input_cache.as_ref().unwrap().shape()[1],
+                    self.input_cache.as_ref().unwrap().shape()[2],
+                    self.input_cache.as_ref().unwrap().shape()[3],
+                ),
+                w_kernel,
+                h_kernel,
+                self.stride,
+                self.padding,
+            )?;
 
-        Ok(grad_x)
+            Ok(grad_x)
+        })
     }
 
     fn visit_params<O: Optimizer>(&mut self, optimizer: &mut O) {

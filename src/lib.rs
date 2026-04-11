@@ -10,6 +10,7 @@ pub mod initialization;
 pub mod layer;
 pub mod optimizer;
 pub mod tensor;
+pub mod utils;
 
 /// system powstał na Wydziale Informatyki Politechniki Białostockiej
 /// ramach pracy inżynierskiej napisanej przez Kacpra Hącia.

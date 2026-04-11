@@ -4,6 +4,7 @@
 
 use crate::error::LibError;
 use crate::layer::Layer;
+use crate::profile_layer;
 use crate::tensor::tensor::Tensor;
 use crate::tensor::tensor::TensorFloat;
 
@@ -140,34 +141,39 @@ impl<T: TensorFloat, const D: usize, F: ActivationFn<T>> Layer<Tensor<T, D>> for
 
     #[inline(always)]
     fn forward(&mut self, input: Tensor<T, D>, save_grads: bool) -> Result<Self::Output, LibError> {
-        if save_grads {
-            let numel = input.shape().iter().product();
-            self.input_cache = Some(input.reshape([numel])?);
-        }
+        profile_layer!(Self, "Forward", {
+            if save_grads {
+                let numel = input.shape().iter().product();
+                let input_r = input.reshape([numel])?;
+                self.input_cache = Some(input_r);
+            }
 
-        let mut output = input.make_unique();
+            let mut output = input.make_unique();
 
-        // PERFORMANCE: THINK about paralell
-        output.map_inplace(|x| self.func.activate(x));
+            // PERFORMANCE: THINK about paralell
+            output.map_inplace(|x| self.func.activate(x));
 
-        Ok(output)
+            Ok(output)
+        })
     }
 
     #[inline(always)]
     fn backward(&mut self, grad_output: Self::Output) -> Result<Tensor<T, D>, LibError> {
-        let cached_1d = self
-            .input_cache
-            .take()
-            .ok_or(LibError::LayerErrorBackwardNoGradient)?;
+        profile_layer!(Self, "backward", {
+            let cached_1d = self
+                .input_cache
+                .take()
+                .ok_or(LibError::LayerErrorBackwardNoGradient)?;
 
-        let cached_input: Tensor<T, D> = cached_1d.reshape(grad_output.shape().clone())?;
+            let cached_input: Tensor<T, D> = cached_1d.reshape(grad_output.shape().clone())?;
 
-        let mut derivative_tensor = cached_input.make_unique();
+            let mut derivative_tensor = cached_input.make_unique();
 
-        // Same here: fully inlined SIMD loop
-        derivative_tensor.map_inplace(|x| self.func.derivative(x));
+            // Same here: fully inlined SIMD loop
+            derivative_tensor.map_inplace(|x| self.func.derivative(x));
 
-        Ok(grad_output.mul_elem(&derivative_tensor))
+            Ok(grad_output.mul_elem(&derivative_tensor))
+        })
     }
 
     #[inline(always)]

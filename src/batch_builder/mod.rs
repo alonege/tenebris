@@ -49,10 +49,10 @@ impl BatchBuilder {
 
     pub fn build_batches_with_labels<T: TensorFloat, const D: usize>(
         data: &Vec<Tensor<T, D>>,
-        labels: &Vec<Tensor<T, D>>,
+        labels: &Vec<Tensor<T, 2>>,
         shuffle: bool,
         batch_size: usize,
-    ) -> Result<(Vec<Tensor<T, D>>, Vec<Tensor<T, D>>), LibError> {
+    ) -> Result<(Vec<Tensor<T, D>>, Vec<Tensor<T, 2>>), LibError> {
         let mut batches = Vec::new();
         let mut batches_labels = Vec::new();
         let mut indices: Vec<usize> = (0..data.len()).collect();
@@ -100,11 +100,11 @@ impl BatchBuilder {
 
     pub fn build_batches_with_labels2<T: TensorFloat, const D: usize>(
         data: &Vec<Tensor<T, D>>,
-        labels: &Vec<Tensor<T, D>>,
+        labels: &Vec<Tensor<T, 2>>,
         shuffle: bool,
         batch_size: usize,
         augmentation: AugmentationOptions,
-    ) -> Result<Vec<(Tensor<T, D>, Tensor<T, D>)>, LibError> {
+    ) -> Result<Vec<(Tensor<T, D>, Tensor<T, 2>)>, LibError> {
         let mut batches = Vec::new();
         let mut indices: Vec<usize> = (0..data.len()).collect();
         let mut rng = rng();

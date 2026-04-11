@@ -31,7 +31,8 @@ where
     #[inline(always)]
     fn forward(&mut self, input: Input, save_grads: bool) -> Result<Self::Output, LibError> {
         let out1 = self.layer1.forward(input, save_grads)?;
-        self.layer2.forward(out1, save_grads)
+        let out = self.layer2.forward(out1, save_grads);
+        out
     }
 
     #[inline(always)]

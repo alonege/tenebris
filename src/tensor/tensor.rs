@@ -95,6 +95,22 @@ impl<T: TensorFloat, const D: usize> Tensor<T, D> {
         Ok(unsafe { Tensor::new_with_strides(shape, strides, data, grad) })
     }
 
+    #[inline(always)]
+    pub fn new_with_id(id: usize, shape: [usize; D], data: Vec<T>) -> Result<Self, LibError> {
+        let expected_len: usize = shape.iter().product();
+        if expected_len != data.len() {
+            return Err(LibError::InvalidShapeForData {
+                shape: shape.to_vec(),
+                expected_len,
+                actual_len: data.len(),
+            });
+        }
+        let strides = Self::compute_strides(&shape);
+        let data = Arc::new(data);
+        let grad = None;
+        Ok(unsafe { Tensor::from_raw_parts(id, shape, data, strides, grad) })
+    }
+
     // WARN: REFACTOR: ADDED RETURN WITH NEW ID
     pub fn new_row(shape: [usize; D], data: Vec<T>) -> Result<Self, LibError> {
         let expected_len: usize = shape.iter().product();
@@ -276,6 +292,10 @@ impl<T: TensorFloat, const D: usize> Tensor<T, D> {
         let expected_len: usize = shape.iter().product();
         let data: Vec<T> = (0..expected_len).map(|_| f(&shape)).collect();
         Self::new(shape, data)
+    }
+
+    pub fn set_id(&mut self, id: usize) {
+        self.id = id;
     }
 
     // WARN: REFACTOR: ADDED RETURN WITH NEW ID
@@ -704,7 +724,7 @@ impl<T: TensorFloat, const D: usize> Tensor<T, D> {
 
     /// Squeezes the specific dimension after summing over it. The programmer
     /// has to provide new size (`const generics` are unstable, so we won't use them here)
-    // WARN: REFACTOR: ADDED RETURN WITH NEW ID
+    // WARN: REFACTOR: ADDED RETURN WITH EXISTING ID
     #[inline(always)]
     pub fn sum_squeeze<const D_OUT: usize>(&self, dim: usize) -> Tensor<T, D_OUT> {
         assert_eq!(
@@ -733,7 +753,13 @@ impl<T: TensorFloat, const D: usize> Tensor<T, D> {
         }
 
         unsafe {
-            Tensor::new_with_strides(new_shape, new_strides, kept_dim_tensor.data.clone(), None)
+            Tensor::from_raw_parts(
+                kept_dim_tensor.id,
+                new_shape,
+                kept_dim_tensor.data.clone(),
+                new_strides,
+                None,
+            )
         }
     }
 

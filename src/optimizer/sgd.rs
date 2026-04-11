@@ -84,6 +84,7 @@ impl Optimizer for SGDWithMomentum {
         &mut self,
         tensor: &mut Tensor<T, D>,
     ) -> Result<(), LibError> {
+        let tensor_id = tensor.get_id();
         if let Some(grad) = &tensor.grad {
             let i = tensor.get_id(); // Zgodnie z nowym nazewnictwem: tensor.id
 
@@ -120,6 +121,7 @@ impl Optimizer for SGDWithMomentum {
                 .sub(&velocity_step)
                 .unwrap();
         }
+        tensor.set_id(tensor_id);
 
         Ok(())
     }

@@ -2,7 +2,7 @@ use rand::distr::Distribution;
 use rand::rng;
 use rand_distr::Normal as NormalDist;
 
-use crate::{error::LibError, initialization::InitializationRawData, tensor::tensor::TensorFloat};
+use crate::{error::LibError, initialization::Initialization, tensor::tensor::TensorFloat};
 
 /// LeCun initialization
 ///
@@ -18,7 +18,7 @@ impl LeCun {
     }
 }
 
-impl<T: TensorFloat> InitializationRawData<T> for LeCun {
+impl<T: TensorFloat> Initialization<T> for LeCun {
     fn initialize_data(
         &self,
         fan_in: usize,

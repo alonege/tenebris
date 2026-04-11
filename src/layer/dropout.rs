@@ -6,6 +6,7 @@
 
 use crate::error::LibError;
 use crate::layer::Layer;
+use crate::profile_layer;
 use crate::tensor::tensor::Tensor;
 use crate::tensor::tensor::TensorFloat;
 use rand::Rng;
@@ -158,30 +159,32 @@ impl<T: TensorFloat, const D: usize> Layer<Tensor<T, D>> for Dropout<T> {
     /// - Inference mode (`training = false`): returns the input identically.
     #[inline(always)]
     fn forward(&mut self, input: Tensor<T, D>, save_grads: bool) -> Result<Self::Output, LibError> {
-        // Bypass completely if in inference mode or probability is 0
-        if !self.training || self.p == T::zero() {
-            self.mask_cache = None;
-            return Ok(input);
-        }
+        profile_layer!(Self, "Forward", {
+            // Bypass completely if in inference mode or probability is 0
+            if !self.training || self.p == T::zero() {
+                self.mask_cache = None;
+                return Ok(input);
+            }
 
-        // Calculate total elements
-        let numel: usize = input.shape().iter().product();
+            // Calculate total elements
+            let numel: usize = input.shape().iter().product();
 
-        // Generate a contiguous 1D mask
-        let mask = self.generate_mask(numel);
+            // Generate a contiguous 1D mask
+            let mask = self.generate_mask(numel);
 
-        // Zero-cost abstraction: Reshape the 1D mask to match the input's D-dimensional shape
-        let mask_d: Tensor<T, D> = mask.reshape(input.shape().clone())?;
+            // Zero-cost abstraction: Reshape the 1D mask to match the input's D-dimensional shape
+            let mask_d: Tensor<T, D> = mask.reshape(input.shape().clone())?;
 
-        let output = input.mul_elem(&mask_d);
+            let output = input.mul_elem(&mask_d);
 
-        if save_grads {
-            self.mask_cache = Some(mask);
-        } else {
-            self.mask_cache = None;
-        }
+            if save_grads {
+                self.mask_cache = Some(mask);
+            } else {
+                self.mask_cache = None;
+            }
 
-        Ok(output)
+            Ok(output)
+        })
     }
 
     /// Backward pass.
@@ -192,21 +195,23 @@ impl<T: TensorFloat, const D: usize> Layer<Tensor<T, D>> for Dropout<T> {
     /// ```
     /// Gradients only flow through non-zeroed elements, scaled by the factor.
     fn backward(&mut self, upstream_grad: Self::Output) -> Result<Tensor<T, D>, LibError> {
-        if !self.training || self.p == T::zero() {
-            return Ok(upstream_grad);
-        }
+        profile_layer!(Self, "Backward", {
+            if !self.training || self.p == T::zero() {
+                return Ok(upstream_grad);
+            }
 
-        let mask = self
-            .mask_cache
-            .take()
-            .ok_or_else(|| LibError::LayerErrorBackwardNoGradient)?;
+            let mask = self
+                .mask_cache
+                .take()
+                .ok_or_else(|| LibError::LayerErrorBackwardNoGradient)?;
 
-        // Restore the mask to D dimensions to match the upstream gradient
-        let mask_d: Tensor<T, D> = mask.reshape(upstream_grad.shape().clone())?;
+            // Restore the mask to D dimensions to match the upstream gradient
+            let mask_d: Tensor<T, D> = mask.reshape(upstream_grad.shape().clone())?;
 
-        let downstream_grad = upstream_grad.mul_elem(&mask_d);
+            let downstream_grad = upstream_grad.mul_elem(&mask_d);
 
-        Ok(downstream_grad)
+            Ok(downstream_grad)
+        })
     }
 
     #[inline(always)]

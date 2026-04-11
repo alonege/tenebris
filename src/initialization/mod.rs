@@ -3,20 +3,13 @@ use crate::{
     tensor::tensor::{Tensor, TensorFloat},
 };
 
-pub trait InitializationRawData<T: TensorFloat> {
-    /// Primary method: initialize raw data
-    /// Most efficient, no shape needed for simple initializers
+pub trait Initialization<T: TensorFloat>: Sized {
     fn initialize_data(
         &self,
         fan_in: usize,
         fan_out: usize,
         n_elements: usize,
     ) -> Result<Vec<T>, LibError>;
-}
-
-pub trait Initialization<T: TensorFloat>: InitializationRawData<T> + Sized {
-    /// Optional override for shape-aware initialization
-    /// Default implementation uses initialize_data
     fn initialize_tensor<const D: usize>(
         &self,
         fan_in: usize,

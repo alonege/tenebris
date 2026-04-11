@@ -46,3 +46,12 @@ mimalloc = "0.1.48"
 [profile.release]
 lto = "fat"
 codegen-units = 1
+
+[features]
+profile-layers = []
+
+[profile.profiling]
+# Dziedziczy wszystkie agresywne optymalizacje z trybu release
+inherits = "release"
+# Ale zachowuje symbole debugowania (przydatne też do zewnętrznych profilerów jak perf/samply)
+debug = true

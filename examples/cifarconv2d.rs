@@ -11,6 +11,7 @@ use std::{
     fs::File,
     io::{Read, Write},
     path::Path,
+    sync::Arc,
     time::{Duration, Instant},
 };
 use tar::Archive;
@@ -20,8 +21,8 @@ use tenebris::{
     errorfn::ErrorFn,
     initialization,
     layer::{
-        Module, ModuleData, activation::Activation, chain::Chain, conv2d::Conv2D, dropout::Dropout,
-        flatten::Flatten, linear::Linear,
+        activation::Activation, chain::Chain, conv2d::Conv2D, dropout::Dropout, flatten::Flatten,
+        linear::Linear,
     },
     optimizer::{
         Optimizer,
@@ -29,15 +30,20 @@ use tenebris::{
     },
     tensor::tensor::{Tensor, TensorFloat},
 };
-//use tikv_jemallocator::Jemalloc;
-//#[global_allocator]
-//static GLOBAL: Jemalloc = Jemalloc;
+use tenebris::{
+    layer::{Layer, chain::ChainBuilder},
+    optimizer::sgd::SGDWithMomentumHyperParams,
+};
+use tikv_jemallocator::Jemalloc;
+#[global_allocator]
+static GLOBAL: Jemalloc = Jemalloc;
 
 //use mimalloc::MiMalloc;
 
 //#[global_allocator]
 //static GLOBAL: MiMalloc = MiMalloc;
 
+/*
 #[derive(Serialize, Deserialize)]
 struct ModelParameters<T: TensorFloat> {
     params: Vec<Tensor<T>>,
@@ -67,6 +73,7 @@ fn load_model<T: TensorFloat + for<'de> Deserialize<'de>>(
     }
     Ok(())
 }
+*/
 
 #[derive(Clone)]
 struct EvalMetrics<T: TensorFloat> {
@@ -94,12 +101,10 @@ struct EvalMetrics<T: TensorFloat> {
 }
 
 fn evaluate<T: TensorFloat + std::iter::Sum>(
-    model: &mut Chain<T>,
-    test_logits: &Vec<Tensor<T>>,
-    test_labels: &Vec<Tensor<T>>,
+    test_logits: &Vec<Tensor<T, 2>>,
+    test_labels: &Vec<Tensor<T, 2>>,
     compute_confusion: bool,
 ) -> EvalMetrics<T> {
-    model.inference();
     let num_classes = 10;
 
     let mut correct = 0;
@@ -224,7 +229,6 @@ fn evaluate<T: TensorFloat + std::iter::Sum>(
         weighted_recall = weighted_recall + per_class_recall[i] * weight;
         weighted_f1 = weighted_f1 + per_class_f1[i] * weight;
     }
-    model.training();
 
     EvalMetrics {
         accuracy,
@@ -342,7 +346,7 @@ fn print_long<T: TensorFloat>(
 fn load_cifar_batch<T: TensorFloat>(
     path: &Path,
     dataset_count: usize,
-) -> (Vec<Tensor<T>>, Vec<Tensor<T>>) {
+) -> (Vec<Tensor<T, 4>>, Vec<Tensor<T, 2>>) {
     let mut file = File::open(path).unwrap();
     let mut buffer = Vec::new();
     file.read_to_end(&mut buffer).unwrap();
@@ -352,7 +356,7 @@ fn load_cifar_batch<T: TensorFloat>(
 
     for i in 0..dataset_count {
         let start = i * 3073;
-        let mut label_tensor = Tensor::<T>::zeros([10, 1]).unwrap();
+        let mut label_tensor = Tensor::<T, 2>::zeros([10, 1]).unwrap();
         label_tensor[&[buffer[start] as usize, 0]] = T::one();
         labels.push(label_tensor);
         let image_raw_data = buffer[start + 1..start + 3073]
@@ -361,11 +365,13 @@ fn load_cifar_batch<T: TensorFloat>(
                 ((T::from(*x).unwrap() * T::from(2.0).unwrap()) / T::from(255).unwrap()) - T::one()
             })
             .collect();
-        let image_tensor = unsafe { Tensor::new_raw([3, 1024], image_raw_data, [1024, 1]) };
+        let image_tensor = unsafe {
+            Tensor::new_with_strides([3, 1024], [1024, 1], Arc::new(image_raw_data), None)
+        };
         let image_tensor = image_tensor
             .make_contiguous()
             .unwrap()
-            .reshape(&[3, 32, 32, 1])
+            .reshape([3, 32, 32, 1])
             .unwrap();
         images.push(image_tensor);
     }
@@ -393,7 +399,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         archive.unpack(dir_path.clone())?;
     }
 
-    let mut images_train: Vec<Tensor<T>> = Vec::new();
+    let mut images_train: Vec<Tensor<T, 4>> = Vec::new();
     let mut labels_train = Vec::new();
     for i in 1..=5 {
         let (images, labels) =
@@ -402,7 +408,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         labels_train.extend(labels);
     }
 
-    let (images_test, labels_test): (Vec<Tensor<T>>, Vec<Tensor<T>>) =
+    let (images_test, labels_test): (Vec<Tensor<T, 4>>, Vec<Tensor<T, 2>>) =
         load_cifar_batch(&data_path.join("test_batch.bin"), 10000);
     println!("Dataset loaded.");
 
@@ -444,33 +450,41 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // */
     let init = initialization::he::He::new();
 
-    let mut model = Chain::new(vec![
-        // 32x32x3 -> 32x32x32
-        Box::new(Conv2D::<T>::new(3, 32, (3, 3), (1, 1), (1, 1), &init)?),
-        Box::new(Activation::elu(1.0)), // ELU > ReLU dla małych sieci
-        Box::new(Dropout::new(0.1)),
-        // 32x32x32 -> 16x16x64
-        Box::new(Conv2D::<T>::new(32, 64, (3, 3), (2, 2), (1, 1), &init)?),
-        Box::new(Activation::elu(1.0)),
-        Box::new(Dropout::new(0.2)),
-        // 16x16x64 -> 8x8x64
-        Box::new(Conv2D::<T>::new(64, 128, (3, 3), (2, 2), (1, 1), &init)?),
-        Box::new(Activation::elu(1.0)),
-        Box::new(Dropout::new(0.3)),
-        // Flatten -> 8*8*64 = 4096
-        Box::new(Flatten::new()),
-        Box::new(Linear::<T>::new_with_init(8 * 8 * 128, 512, &init)?),
-        Box::new(Activation::elu(1.0)),
-        Box::new(Dropout::new(0.5)),
-        // 512 -> 128
-        Box::new(Linear::<T>::new_with_init(512, 128, &init)?),
-        Box::new(Activation::elu(1.0)),
-        Box::new(Dropout::new(0.5)),
-        // Output
-        Box::new(Linear::<T>::new_with_init(128, 10, &init)?),
-    ]);
+    let mut model = Conv2D::<T>::new(3, 32, (3, 3), (1, 1), (1, 1), &init)?
+        .add(Activation::new(tenebris::layer::activation::Elu {
+            alpha: 1.0,
+        }))
+        .add(Dropout::new(0.1))
+        .add(Conv2D::<T>::new(32, 64, (3, 3), (2, 2), (1, 1), &init)?)
+        .add(Activation::new(tenebris::layer::activation::Elu {
+            alpha: 1.0,
+        }))
+        .add(Dropout::new(0.2))
+        .add(Conv2D::<T>::new(64, 128, (3, 3), (2, 2), (1, 1), &init)?)
+        .add(Activation::new(tenebris::layer::activation::Elu {
+            alpha: 1.0,
+        }))
+        .add(Dropout::new(0.3))
+        .add(Flatten::new())
+        .add(Linear::<T>::new_with_init(8 * 8 * 128, 512, &init)?)
+        .add(Activation::new(tenebris::layer::activation::Elu {
+            alpha: 1.0,
+        }))
+        .add(Dropout::new(0.5))
+        .add(Linear::<T>::new_with_init(512, 128, &init)?)
+        .add(Activation::new(tenebris::layer::activation::Elu {
+            alpha: 1.0,
+        }))
+        .add(Dropout::new(0.5))
+        .add(Linear::<T>::new_with_init(128, 10, &init)?);
 
-    let mut optimizer = SGDWithMomentum::new(0.01, 0.9, 0.01); // wyższy LR
+    model.inference();
+    let mut optimizer =
+        SGDWithMomentum::new(tenebris::optimizer::sgd::SGDWithMomentumHyperParams {
+            learning_rate: 0.01,
+            momentum: 0.9,
+            decay: 0.01,
+        });
     //
     let epochs = 50; // Więcej epok, bo mniej sampli per epoch
     let samples_per_epoch = 50000;
@@ -498,7 +512,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let timer = Instant::now();
     for b in images.iter().progress() {
-        let x: Tensor<f32> = model.forward(b.clone(), false).unwrap();
+        let x: Tensor<f32, 2> = model.forward(b.clone(), false).unwrap();
         logits.push(x);
     }
     println!(
@@ -508,13 +522,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     model.training();
 
-    let metrics = evaluate(&mut model, &logits, &labels, false);
+    let metrics = evaluate(&logits, &labels, false);
     println!(
         "Forward + evaluate time for test set: {:.2}ms",
         timer.elapsed().as_secs_f32() * 1000.0
     );
     print_eval(metrics, 0, epochs, 0.0);
     println!("Parameter value stats in Modules:");
+    /*
     for (num, param) in model.parameters().iter().enumerate() {
         let data = param;
         let mut sum = 0.0;
@@ -538,6 +553,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .sqrt();
         println!("Module[{num}]: mean={mean:.6}, max|W|={max_abs:.6}, l2={l2_norm:.6}");
     }
+    */
 
     println!("===============================================================");
     model.clear_grad();
@@ -576,19 +592,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let start = Instant::now();
         let mut i = 0;
         if epoch == 25 || epoch == 35 {
-            optimizer.set_learning_rate(optimizer.get_learning_rate() * 0.1);
+            let new_lr = optimizer.get_hyper_params().learning_rate * 0.1;
+            optimizer.set_hyper_params(SGDWithMomentumHyperParams {
+                learning_rate: new_lr,
+                momentum: optimizer.get_hyper_params().momentum,
+                decay: optimizer.get_hyper_params().decay,
+            });
             println!(
                 "--- learning rate decay! now: {:.6} ---",
-                optimizer.get_learning_rate()
+                optimizer.get_hyper_params().learning_rate
             );
         }
+        model.training();
         for b in img_label_touple_batch.iter().progress() {
             let (img, lab) = b;
 
             //println!("IMG SIZE: {:?}", img.shape());
 
             let start = Instant::now();
-            let y: Tensor<f32> = model.forward(img.clone(), true).unwrap();
+            let y: Tensor<f32, 2> = model.forward(img.clone(), true).unwrap();
             time_forward += start.elapsed();
             //println!("y: {y}");
             //println!("t: {lab}");
@@ -631,13 +653,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             let start = Instant::now();
-            model.backward(ModuleData::Single(loss_grad)).unwrap();
+            model.backward(loss_grad).unwrap();
             time_backward += start.elapsed();
 
             //if i % 32 == 0 || i % (samples_per_epoch - 1) == 0 {
             let start = Instant::now();
-            optimizer.step(&mut model).unwrap();
+            model.visit_params(&mut optimizer);
             time_optim += start.elapsed();
+            model.clear_grad();
             //}
             i = i + 1;
         }
@@ -656,9 +679,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("|--> Train Accuracy: {:}%", train_accuracy);
         if train_accuracy > best_accuracy_train {
             best_accuracy_train = train_accuracy;
-            save_model(&model, &format!("model_{best_accuracy_train}.json")).unwrap();
+            //save_model(&model, &format!("model_{best_accuracy_train}.json")).unwrap();
         }
-
+        model.inference();
         // eval co x epok
         if epoch % 1 == 0 {
             println!("===============================================================");
@@ -675,10 +698,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut y = Vec::new();
             let el = Instant::now();
             for b in images.iter().progress() {
-                let x: Tensor<f32> = model.forward(b.clone(), false).unwrap();
+                let x: Tensor<f32, 2> = model.forward(b.clone(), false).unwrap();
                 y.push(x);
             }
-            let metrics = evaluate(&mut model, &y, &labels, false);
+            let metrics = evaluate(&y, &labels, false);
             println!("FORWARD: {:?}", el.elapsed());
             model.training();
             //print_eval(metrics, epoch, epochs, train_accuracy);
@@ -687,49 +710,51 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         // TODO: FIX IT chyba fixed
         println!("---DEBUG---");
-        println!("Parameter value stats in Modules:");
-        for (num, param) in model.parameters().iter().enumerate() {
-            let data = param;
-            let mut sum = 0.0;
-            let mut max_abs = 0.0;
-            for x in data.iter() {
-                let v = x;
-                sum += v;
-                let abs_v = v.abs();
-                if abs_v > max_abs {
-                    max_abs = abs_v;
+        /*
+            println!("Parameter value stats in Modules:");
+            for (num, param) in model.parameters().iter().enumerate() {
+                let data = param;
+                let mut sum = 0.0;
+                let mut max_abs = 0.0;
+                for x in data.iter() {
+                    let v = x;
+                    sum += v;
+                    let abs_v = v.abs();
+                    if abs_v > max_abs {
+                        max_abs = abs_v;
+                    }
                 }
+                let mean = sum / data.get_data().len() as T;
+                let l2_norm: T = data
+                    .iter()
+                    .map(|x| {
+                        let v = x.to_f32().unwrap();
+                        v * v
+                    })
+                    .sum::<T>()
+                    .sqrt();
+                println!("Module[{num}]: mean={mean:.6}, max|W|={max_abs:.6}, l2={l2_norm:.6}");
             }
-            let mean = sum / data.get_data().len() as T;
-            let l2_norm: T = data
-                .iter()
-                .map(|x| {
-                    let v = x.to_f32().unwrap();
-                    v * v
-                })
-                .sum::<T>()
-                .sqrt();
-            println!("Module[{num}]: mean={mean:.6}, max|W|={max_abs:.6}, l2={l2_norm:.6}");
-        }
-        println!(
-            "Forward: {:.2}ms, Loss: {:.2}ms, Backward: {:.2}ms, Optim: {:.2}ms",
-            time_forward.as_secs_f32() * 1000.0,
-            time_loss.as_secs_f32() * 1000.0,
-            time_backward.as_secs_f32() * 1000.0,
-            time_optim.as_secs_f32() * 1000.0,
-        );
-        println!("---DEBUG-END---");
+            println!(
+                "Forward: {:.2}ms, Loss: {:.2}ms, Backward: {:.2}ms, Optim: {:.2}ms",
+                time_forward.as_secs_f32() * 1000.0,
+                time_loss.as_secs_f32() * 1000.0,
+                time_backward.as_secs_f32() * 1000.0,
+                time_optim.as_secs_f32() * 1000.0,
+            );
+            println!("---DEBUG-END---");
+        */
         model.clear_grad();
     }
 
     println!("Training finished.");
 
     println!("\nSaving model...");
-    save_model(&model, "model.json").unwrap();
+    //save_model(&model, "model.json").unwrap();
     println!("Model saved.");
 
     println!("\nLoading model...");
-    load_model(&mut model, "model.json").unwrap();
+    //load_model(&mut model, "model.json").unwrap();
     println!("Model loaded.");
 
     println!("\nEvaluating final model...");
