@@ -10,6 +10,9 @@ use crate::profile_layer;
 use crate::tensor::tensor::Tensor;
 use crate::tensor::tensor::TensorFloat;
 use rand::Rng;
+//use rayon::iter::IntoParallelRefMutIterator;
+use rayon::iter::ParallelIterator;
+use rayon::slice::ParallelSliceMut;
 
 /// Dropout layer implementing regularization via random zeroing of activations.
 ///
@@ -94,15 +97,6 @@ impl<T: TensorFloat> Dropout<T> {
         }
     }
 
-    /// Sets the mode of the layer.
-    ///
-    /// # Arguments
-    /// * `training` - `true` for training mode, `false` for inference
-    #[inline(always)]
-    pub fn set_training(&mut self, training: bool) {
-        self.training = training;
-    }
-
     /// Checks if the layer is currently in training mode.
     #[inline(always)]
     pub fn is_training(&self) -> bool {
@@ -117,14 +111,14 @@ impl<T: TensorFloat> Dropout<T> {
 
     /// Switches the layer to training mode.
     #[inline(always)]
-    pub fn train(&mut self) {
-        self.set_training(true);
+    fn train(&mut self) {
+        self.training = true;
     }
 
     /// Switches the layer to inference (evaluation) mode.
     #[inline(always)]
-    pub fn eval(&mut self) {
-        self.set_training(false);
+    fn eval(&mut self) {
+        self.training = false;
     }
 
     /// Generates a flat 1D dropout mask for a given number of elements.
@@ -136,16 +130,60 @@ impl<T: TensorFloat> Dropout<T> {
         let mut rng = rand::rng();
         let zero = T::zero();
 
-        let p_f64: f64 = self.p.to_f64().unwrap_or(0.5);
+        let p_f64: f32 = self.p.to_f32().unwrap_or(0.5);
 
         let data: Vec<T> = (0..numel)
             .map(|_| {
-                let rand_val: f64 = rng.random();
+                let rand_val: f32 = rng.random();
                 if rand_val < p_f64 { zero } else { self.scale }
             })
             .collect();
 
         Tensor::new([numel], data).unwrap()
+    }
+
+    fn update_mask(&mut self, numel: usize) {
+        let p_f64 = self.p.to_f32().unwrap_or(0.5);
+        let zero = T::zero();
+
+        // let's check if we need to create a new mask tensor
+        let needs_new = match &self.mask_cache {
+            // there is mask, but check for size mismatch
+            Some(m) => m.shape()[0] != numel,
+            // no mask
+            None => true,
+        };
+
+        if needs_new {
+            self.mask_cache = Some(self.generate_mask(numel));
+            return;
+        }
+
+        if let Some(mask) = self.mask_cache.take() {
+            let scale = self.scale;
+            let mut mask_mut = mask.make_unique();
+
+            let data_slice = mask_mut.get_data_mut();
+            /*
+            crate::utils::with_rng(|rng| {
+                for val in data_slice.iter_mut() {
+                    let rand_val: f64 = rng.random();
+                    *val = if rand_val < p_f64 { zero } else { self.scale };
+                }
+            });
+            */
+            data_slice.par_chunks_mut(4096).for_each(|chunk| {
+                // for each chunk of 4096 elements, we generate random numbers in parallel
+                crate::utils::with_rng(|rng| {
+                    for val in chunk.iter_mut() {
+                        let rand_val: f32 = rng.random();
+                        *val = if rand_val < p_f64 { zero } else { scale };
+                    }
+                });
+            });
+
+            self.mask_cache = Some(mask_mut);
+        }
     }
 }
 
@@ -158,7 +196,11 @@ impl<T: TensorFloat, const D: usize> Layer<Tensor<T, D>> for Dropout<T> {
     /// - Training mode (`training = true`): applies dropout mask with inverted scaling.
     /// - Inference mode (`training = false`): returns the input identically.
     #[inline(always)]
-    fn forward(&mut self, input: Tensor<T, D>, save_grads: bool) -> Result<Self::Output, LibError> {
+    fn forward(
+        &mut self,
+        input: Tensor<T, D>,
+        _save_grads: bool,
+    ) -> Result<Self::Output, LibError> {
         profile_layer!(Self, "Forward", {
             // Bypass completely if in inference mode or probability is 0
             if !self.training || self.p == T::zero() {
@@ -170,18 +212,17 @@ impl<T: TensorFloat, const D: usize> Layer<Tensor<T, D>> for Dropout<T> {
             let numel: usize = input.shape().iter().product();
 
             // Generate a contiguous 1D mask
-            let mask = self.generate_mask(numel);
+            self.update_mask(numel);
+
+            let mask = self
+                .mask_cache
+                .as_ref()
+                .ok_or_else(|| LibError::LayerErrorBackwardNoGradient)?;
 
             // Zero-cost abstraction: Reshape the 1D mask to match the input's D-dimensional shape
             let mask_d: Tensor<T, D> = mask.reshape(input.shape().clone())?;
 
             let output = input.mul_elem(&mask_d);
-
-            if save_grads {
-                self.mask_cache = Some(mask);
-            } else {
-                self.mask_cache = None;
-            }
 
             Ok(output)
         })
@@ -226,12 +267,12 @@ impl<T: TensorFloat, const D: usize> Layer<Tensor<T, D>> for Dropout<T> {
 
     #[inline(always)]
     fn training(&mut self) {
-        self.set_training(true);
+        self.train();
     }
 
     #[inline(always)]
     fn inference(&mut self) {
-        self.set_training(false);
+        self.eval();
     }
 }
 
@@ -249,7 +290,7 @@ mod tests {
         let input = Tensor::ones([3, 3]).unwrap();
 
         // Forward w trybie treningowym
-        dropout.set_training(true);
+        dropout.train();
         let output = dropout.forward(input.clone(), true).unwrap();
 
         // Sprawdź kształt
@@ -275,7 +316,7 @@ mod tests {
         let input = Tensor::from_slice([2, 2], vec![1.0, 2.0, 3.0, 4.0]).unwrap();
 
         // Forward w trybie inferencji
-        dropout.set_training(false);
+        dropout.eval();
         let output = dropout.forward(input.clone(), false).unwrap();
 
         // Wartości powinny być identyczne
@@ -291,7 +332,7 @@ mod tests {
     #[test]
     fn test_dropout_p_zero() {
         let mut dropout = Dropout::<f32>::new(0.0);
-        dropout.set_training(true);
+        dropout.train();
 
         let input = Tensor::from_slice([2, 2], vec![1.0, 2.0, 3.0, 4.0]).unwrap();
         let output = dropout.forward(input.clone(), true).unwrap();
@@ -305,7 +346,7 @@ mod tests {
     #[test]
     fn test_dropout_scaling() {
         let mut dropout = Dropout::<f32>::new(0.5);
-        dropout.set_training(true);
+        dropout.train();
 
         let input = Tensor::ones([1000]).unwrap();
         let output = dropout.forward(input, true).unwrap();
@@ -324,7 +365,7 @@ mod tests {
     #[test]
     fn test_dropout_backward() {
         let mut dropout = Dropout::<f32>::new(0.5);
-        dropout.set_training(true);
+        dropout.train();
 
         let input = Tensor::ones([4, 4]).unwrap();
         let _output = dropout.forward(input, true).unwrap();
@@ -341,33 +382,34 @@ mod tests {
     #[test]
     fn test_dropout_batch_3d() {
         let mut dropout = Dropout::<f32>::new(0.3);
-        dropout.set_training(true);
+        dropout.train();
 
         // Symulacja batcha: (features=10, height=4, batch=8)
+        //
         let input = Tensor::ones([10, 4, 8]).unwrap();
         let output = dropout.forward(input.clone(), true).unwrap();
 
         assert_eq!(output.shape(), input.shape());
     }
 
-    /// Test obsługi 4D tensora (conv layers)
+    /// Test for 4D tensor
     #[test]
     fn test_dropout_batch_4d() {
         let mut dropout = Dropout::<f32>::new(0.2);
-        dropout.set_training(true);
+        dropout.train();
 
-        // Symulacja conv output: (channels=16, height=8, width=8, batch=4)
+        // channels=16, height=8, width=8, batch=4
         let input = Tensor::ones([16, 8, 8, 4]).unwrap();
         let output = dropout.forward(input.clone(), true).unwrap();
 
         assert_eq!(output.shape(), input.shape());
     }
 
-    /// Test że backward bez forward rzuca błąd
+    /// backward called without a prior forward call should return an error
     #[test]
     fn test_dropout_backward_without_forward() {
         let mut dropout = Dropout::<f32>::new(0.5);
-        dropout.set_training(true);
+        dropout.train();
 
         let upstream = Tensor::ones([2, 2]).unwrap();
         let result = dropout.backward(upstream);
@@ -379,7 +421,7 @@ mod tests {
     #[test]
     fn test_dropout_clear_grad() {
         let mut dropout = Dropout::<f32>::new(0.5);
-        dropout.set_training(true);
+        dropout.train();
 
         let input = Tensor::ones([3, 3]).unwrap();
         let _output = dropout.forward(input, true).unwrap();

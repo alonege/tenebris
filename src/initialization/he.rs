@@ -1,5 +1,5 @@
 use rand::distr::Distribution;
-use rand::rng;
+use rand::{SeedableRng, rngs::SmallRng};
 use rand_distr::Normal as NormalDist;
 
 use crate::{error::LibError, initialization::Initialization, tensor::tensor::TensorFloat};
@@ -27,7 +27,7 @@ impl<T: TensorFloat> Initialization<T> for He {
     ) -> Result<Vec<T>, LibError> {
         let std = (2.0 / fan_in as f64).sqrt();
 
-        let mut rng = rng();
+        let mut rng = SmallRng::from_rng(&mut rand::rng());
         let normal = NormalDist::new(0.0, std).map_err(|e| {
             LibError::OtherError(format!("Failed to create normal distribution: {}", e))
         })?;

@@ -812,6 +812,14 @@ impl<T: TensorFloat, const D: usize> Tensor<T, D> {
         self.data.as_slice()
     }
 
+    #[inline(always)]
+    pub fn get_data_mut(&mut self) -> &mut [T] {
+        match Arc::get_mut(&mut self.data) {
+            Some(data) => data.as_mut_slice(),
+            None => panic!("Cannot get mutable reference to data, it is shared"),
+        }
+    }
+
     //pub fn iter(&self) -> TensorIter<'_, T> {
     //    TensorIter {
     //        tensor: self,

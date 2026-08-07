@@ -489,7 +489,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let epochs = 50; // Więcej epok, bo mniej sampli per epoch
     let samples_per_epoch = 50000;
     //let minibatch_size = 32;
-    let _batch_size = 64;
+    let batch_size = 1024;
 
     //println!("\nLoading model...");
     //load_model(&mut model, "model_75.228.json").unwrap();
@@ -584,7 +584,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &images_train,
                 &labels_train,
                 true,
-                _batch_size,
+                batch_size,
                 augmentation.clone(),
             )
             .unwrap();
