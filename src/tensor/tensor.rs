@@ -236,6 +236,7 @@ impl<T: TensorFloat, const D: usize> Tensor<T, D> {
         Self::new(shape, data)
     }
 
+    // INFO: moved to: tensor2/layout.rs
     const fn compute_strides<const N: usize>(shape: &[usize; N]) -> [isize; N] {
         let mut strides = [0isize; N];
         let mut prod = 1;
@@ -250,6 +251,7 @@ impl<T: TensorFloat, const D: usize> Tensor<T, D> {
         strides
     }
 
+    // INFO: moved to: tensor2/layout.rs
     const fn compute_strides_row<const N: usize>(shape: &[usize; N]) -> [isize; N] {
         let mut strides = [0isize; N];
         let mut prod = 1;
@@ -332,12 +334,14 @@ impl<T: TensorFloat, const D: usize> Tensor<T, D> {
         Ok(unsafe { Tensor::new_with_strides(shape, strides, data, grad) })
     }
 
+    // INFO: moved to: tensor2/layout.rs
     /// Returns the shape of the tensor
     #[inline(always)]
     pub fn shape(&self) -> &[usize; D] {
         &self.shape
     }
 
+    // INFO: moved to: tensor2/layout.rs
     #[inline(always)]
     pub fn strides(&self) -> &[isize; D] {
         &self.strides
@@ -465,7 +469,7 @@ impl<T: TensorFloat, const D: usize> Tensor<T, D> {
 
     /// Reshapes the tensor if compatible. This is a zero-copy operation.
     /// The tensor must be contiguous.
-    // WARN: REFACTOR: ADDED RETURN WITH EXISTING ID
+    //  WARN: REFACTOR: ADDED RETURN WITH EXISTING ID
     #[inline(always)]
     pub fn reshape<const N: usize>(&self, shape: [usize; N]) -> Result<Tensor<T, N>, LibError> {
         let new_len: usize = shape.iter().product();
@@ -663,6 +667,7 @@ impl<T: TensorFloat, const D: usize> Tensor<T, D> {
         Arc::strong_count(&self.data) == 1
     }
 
+    // INFO: moved to: tensor2/layout.rs
     #[inline(always)]
     pub fn physical_offset(&self, logical_idx: impl AsRef<[usize]>) -> isize {
         let logical_idx = logical_idx.as_ref();
@@ -670,25 +675,6 @@ impl<T: TensorFloat, const D: usize> Tensor<T, D> {
             .iter()
             .zip(self.strides.iter())
             .fold(0isize, |acc, (&ind, &stride)| acc + ind as isize * stride)
-    }
-
-    #[inline(always)]
-    pub fn logical_index(&self, physical_idx: isize) -> Option<Vec<usize>> {
-        let mut remaining = physical_idx;
-        let mut logical_idx = vec![0; self.shape.len()];
-
-        for (i, &stride) in self.strides.iter().enumerate().rev() {
-            if stride == 0 {
-                return None; // Avoid division by zero
-            }
-            logical_idx[i] = (remaining / stride) as usize;
-            if logical_idx[i] >= self.shape[i] {
-                return None; // Out of bounds
-            }
-            remaining -= logical_idx[i] as isize * stride;
-        }
-
-        Some(logical_idx)
     }
 
     #[inline(always)]
@@ -1066,6 +1052,8 @@ impl<T: TensorFloat, const D: usize> Tensor<T, D> {
         })
     }
 
+    // INFO: moved to: tensor2/layout.rs
+    //
     /// Returns a new view of the tensor with singleton dimensions expanded
     /// to a larger size.
     ///
@@ -1295,6 +1283,7 @@ impl<'a, T: TensorFloat, const D: usize> Tensor<T, D> {
     }
 }
 
+// WARN: MOVED
 impl<T, const D: usize> MatMul<Tensor<T, D>> for Tensor<T, 2>
 where
     T: TensorFloat,
@@ -1579,23 +1568,6 @@ mod tests {
         assert_eq!(tensor.data.as_slice(), unique_tensor.data.as_slice());
         assert_eq!(tensor.shape(), unique_tensor.shape());
         assert_eq!(tensor.strides, unique_tensor.strides);
-    }
-
-    #[test]
-    fn logical_physical_index() {
-        let tensor = Tensor::new([3, 4, 2], (0..24).map(|x| x as f64).collect()).unwrap();
-        for i in 0..24 {
-            let logical_idx = tensor.logical_index(i).unwrap();
-            let physical_idx = tensor.physical_offset(&logical_idx);
-            assert_eq!(physical_idx, i as isize);
-        }
-    }
-
-    #[test]
-    fn physical_index_out_of_bounds() {
-        let tensor = Tensor::new([3, 4, 2], (0..24).map(|x| x as f64).collect()).unwrap();
-        assert!(tensor.logical_index(24).is_none());
-        assert!(tensor.logical_index(100).is_none());
     }
 
     #[test]
